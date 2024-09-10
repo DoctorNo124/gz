@@ -65,7 +65,8 @@ static void save_ovl(void **p, void *addr,
       Z64_VERSION == Z64_OOTMQU || \
       Z64_VERSION == Z64_OOTGCJ || \
       Z64_VERSION == Z64_OOTGCU || \
-      Z64_VERSION == Z64_OOTCEJ
+      Z64_VERSION == Z64_OOTCEJ || \
+      Z64_VERSION == Z64_OOTGCPAL
   z64_ovl_hdr_t l_hdr;
   hdr = &l_hdr;
   yaz0_begin(file->prom_start);
@@ -149,7 +150,8 @@ static void load_ovl(void **p, void **p_addr,
       Z64_VERSION == Z64_OOTMQU || \
       Z64_VERSION == Z64_OOTGCJ || \
       Z64_VERSION == Z64_OOTGCU || \
-      Z64_VERSION == Z64_OOTCEJ
+      Z64_VERSION == Z64_OOTCEJ || \
+      Z64_VERSION == Z64_OOTGCPAL
   z64_ovl_hdr_t l_hdr;
   hdr = &l_hdr;
   serial_read(p, hdr, sizeof(*hdr));
@@ -1154,7 +1156,8 @@ uint32_t save_state(struct state_meta *state)
       Z64_VERSION == Z64_OOTMQU || \
       Z64_VERSION == Z64_OOTGCJ || \
       Z64_VERSION == Z64_OOTGCU || \
-      Z64_VERSION == Z64_OOTCEJ
+      Z64_VERSION == Z64_OOTCEJ || \
+      Z64_VERSION == Z64_OOTGCPAL
   serial_write(&p, &code_800EC960_c_data[0x0998], 0x0060); /* 12b overhead */
   serial_write(&p, &code_800EC960_c_data[0x0A00], 0x0008);
   serial_write(&p, &code_800EC960_c_data[0x118C], 0x0144);
@@ -2112,7 +2115,8 @@ void load_state(const struct state_meta *state)
       Z64_VERSION == Z64_OOTMQU || \
       Z64_VERSION == Z64_OOTGCJ || \
       Z64_VERSION == Z64_OOTGCU || \
-      Z64_VERSION == Z64_OOTCEJ
+      Z64_VERSION == Z64_OOTCEJ || \
+      Z64_VERSION == Z64_OOTGCPAL
     serial_read(&p, &code_800EC960_c_data[0x0998], 0x0060); /* 12b overhead */
     serial_read(&p, &code_800EC960_c_data[0x0A00], 0x0008);
     serial_read(&p, &code_800EC960_c_data[0x118C], 0x0144);

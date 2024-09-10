@@ -86,7 +86,6 @@ for ovl_type, ovl_tbl in pairs(ovl_tbls) do
   local layout = ovl_tbl_layout[ovl_type]
 
   local p = (ovl_tbl.addr - code_vram) & 0x1FFFFFFF
-
   local tbl_stride      = ovl_tbl.stride      or layout.stride
   local tbl_vrom_start  = ovl_tbl.vrom_start  or layout.vrom_start
   local tbl_vrom_end    = ovl_tbl.vrom_end    or layout.vrom_end
@@ -130,14 +129,19 @@ for _, gsc in ipairs(gsc_list) do
     addr = addr - (obj.vram_start & 0x00FFFFFF)
 
     local file_idx = fs:vat(obj.vrom_start)
-    local file_gsc = file_gsc_map[file_idx]
 
-    if file_gsc == nil then
-      file_gsc = gru.gsc_create()
-      file_gsc_map[file_idx] = file_gsc
+    if file_idx == nil then 
+      print(obj.vrom_start)
+    else 
+      local file_gsc = file_gsc_map[file_idx]
+
+      if file_gsc == nil then
+        file_gsc = gru.gsc_create()
+        file_gsc_map[file_idx] = file_gsc
+      end
+
+      file_gsc:insert(file_gsc:size(), addr, value)
     end
-
-    file_gsc:insert(file_gsc:size(), addr, value)
   end
 end
 

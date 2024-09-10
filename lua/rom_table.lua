@@ -223,6 +223,26 @@ rom_table =
                     gz_name     = "gz-oot-ce-j" .. version_suffix,
                     title_id    = "NGEJ",
                   },
+  [0x3FBD519F]  = {
+                    game        = "oot",
+                    version     = "gc",
+                    region      = "pal",
+                    boot_ind    = 1,
+                    boot_ram    = 0x80000460,
+                    code_ind    = 28,
+                    code_ram    = 0x80010F00,
+                    ovl_tbls    = {
+                                    part      = { addr = 0x800E4AB0 },
+                                    actor     = { addr = 0x800E53A0 },
+                                    state     = { addr = 0x800EE1B0 },
+                                    map_mark  = { addr = 0x800EEA68 },
+                                    play      = { addr = 0x800FB300 },
+                                  },
+                    data_dir    = "oot-gc-pal",
+                    gz_version  = "oot-gc-pal" .. version_suffix,
+                    gz_name     = "gz-oot-gc-pal" .. version_suffix,
+                    title_id    = "NGPL",
+                  },
 }
 
 vc_table =
