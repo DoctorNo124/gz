@@ -1618,14 +1618,19 @@ void load_state(const struct state_meta *state)
         zu_getfile(vaddr, z64_game.pause_ctxt.name_texture, 0x0400);
       }
     }
-    if (z64_file.language == 0) {
-      zu_getfile_idx(z64_icon_item_jpn_static,
+    #if Z64_VERSION == Z64_OOTGCPAL
+          zu_getfile_idx(z64_icon_item_nes_static,
                      z64_game.pause_ctxt.icon_item_lang);
-    }
-    else {
-      zu_getfile_idx(z64_icon_item_nes_static,
-                     z64_game.pause_ctxt.icon_item_lang);
-    }
+    #else
+      if (z64_file.language == 0) {
+        zu_getfile_idx(z64_icon_item_jpn_static,
+                      z64_game.pause_ctxt.icon_item_lang);
+      }
+      else {
+        zu_getfile_idx(z64_icon_item_nes_static,
+                      z64_game.pause_ctxt.icon_item_lang);
+      }
+    #endif
     zu_getfile_idx(z64_icon_item_static, z64_game.pause_ctxt.icon_item);
     zu_getfile_idx(z64_icon_item_24_static, z64_game.pause_ctxt.icon_item_24);
     /* gray out restricted items */
