@@ -27,7 +27,7 @@ ALL_LDFLAGS           = -T $(LDSCRIPT) -L$(LIBDIR) -nostartfiles -specs=nosys.sp
 ALL_LDLIBS            = $(LDLIBS)
 LUAFILE               = $(EMUDIR)/Lua/patch-data.lua
 RESDESC               = $(RESDIR)/resources.json
-GZ_VERSIONS           = oot-gc-pal
+GZ_VERSIONS           = oot-gc-pal oot-gc-pal-vc
 GZ_ADDRESS            = 80400060
 LDR_ADDRESS           = 80000400
 SRCDIR                = src
