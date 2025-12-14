@@ -3,21 +3,7 @@
 #include <stdint.h>
 #include <n64.h>
 #include "gu.h"
-
-#ifndef Z64_VERSION
-# error no z64 version specified
-#endif
-
-#define Z64_OOT10             0x00
-#define Z64_OOT11             0x01
-#define Z64_OOT12             0x02
-#define Z64_OOTMQJ            0x03
-#define Z64_OOTMQU            0x04
-#define Z64_OOTGCJ            0x05
-#define Z64_OOTGCU            0x06
-#define Z64_OOTCEJ            0x07
-#define Z64_OOTGCPAL          0x08
-
+#include "z64_version.h"
 
 #define Z64_SCREEN_WIDTH      320
 #define Z64_SCREEN_HEIGHT     240
@@ -71,7 +57,8 @@ struct z64_arena
       Z64_VERSION == Z64_OOTGCJ || \
       Z64_VERSION == Z64_OOTGCU || \
       Z64_VERSION == Z64_OOTCEJ || \
-      Z64_VERSION == Z64_OOTGCPAL
+      Z64_VERSION == Z64_OOTGCPAL || \
+      Z64_VERSION == Z64_OOTIQC
                                               /* 0x0008 */
 #endif
 };
@@ -99,7 +86,8 @@ struct z64_arena_node
       Z64_VERSION == Z64_OOTGCJ || \
       Z64_VERSION == Z64_OOTGCU || \
       Z64_VERSION == Z64_OOTCEJ || \
-      Z64_VERSION == Z64_OOTGCPAL
+      Z64_VERSION == Z64_OOTGCPAL || \
+      Z64_VERSION == Z64_OOTIQC
   char              data[];                   /* 0x0010 */
 #endif
 };
@@ -790,23 +778,8 @@ typedef struct
   uint8_t           z_targeting;              /* 0x140C */
   char              unk_0x140D[0x0001];       /* 0x140D */
   uint16_t          disable_music_flag;       /* 0x140E */
-#if Z64_VERSION == Z64_OOT10 || \
-    Z64_VERSION == Z64_OOT11 || \
-    Z64_VERSION == Z64_OOT12
-  char              unk_0x1410[0x0020];       /* 0x1410 */
-  z64_gameinfo_t   *gameinfo;                 /* 0x1430 */
-  char              unk_0x1434[0x001C];       /* 0x1434 */
-#elif Z64_VERSION == Z64_OOTMQJ || \
-      Z64_VERSION == Z64_OOTMQU || \
-      Z64_VERSION == Z64_OOTGCJ || \
-      Z64_VERSION == Z64_OOTGCU || \
-      Z64_VERSION == Z64_OOTCEJ || \
-      Z64_VERSION == Z64_OOTGCPAL
   char              unk_0x1410[0x0018];       /* 0x1410 */
-  z64_gameinfo_t   *gameinfo;                 /* 0x1428 */
-  char              unk_0x142C[0x0024];       /* 0x142C */
-#endif
-                                              /* 0x1450 */
+                                              /* 0x1428 */
 } z64_file_t;
 
 typedef struct
@@ -2154,7 +2127,8 @@ typedef struct
       Z64_VERSION == Z64_OOTMQU || \
       Z64_VERSION == Z64_OOTGCJ || \
       Z64_VERSION == Z64_OOTGCU || \
-      Z64_VERSION == Z64_OOTCEJ
+      Z64_VERSION == Z64_OOTCEJ || \
+      Z64_VERSION == Z64_OOTIQC
 # define z64_icon_item_static                   8
 # define z64_icon_item_24_static                9
 # define z64_icon_item_field_static             10
@@ -2287,6 +2261,10 @@ typedef struct
 
 /* data */
 #define     z64_extern            extern __attribute__ ((section(".data")))
+z64_extern  void                 *__osBbSramAddress;
+z64_extern  uint32_t              __osBbSramSize;
+z64_extern  uint32_t              __osBbIsBb;
+z64_extern  uint32_t              __osBbHackFlags;
 z64_extern  OSThread              z64_thread_idle;
 z64_extern  OSThread              z64_thread_main;
 z64_extern  OSThread              z64_thread_dmamgr;
@@ -2347,6 +2325,7 @@ z64_extern  uint8_t               z64_afx_cfg;
 z64_extern  uint8_t               z64_afx_config_busy;
 z64_extern  uint32_t              z64_random;
 z64_extern  char                  z64_message_state[];
+z64_extern  char                  z64_textbox_skipped;
 z64_extern  char                  z64_staff_notes[];
 z64_extern  int16_t               z64_message_select_state;
 z64_extern  char                  z64_message_icon_state[];
@@ -2357,6 +2336,7 @@ z64_extern  char                  z64_fw_state_1[];
 z64_extern  char                  z64_fw_state_2[];
 z64_extern  char                  z64_camera_state[];
 z64_extern  z64_file_t            z64_file;
+z64_extern  z64_gameinfo_t       *z64_gameinfo;
 z64_extern  char                  z64_cs_state[];
 z64_extern  z64_light_queue_t     z64_light_queue;
 z64_extern  z64_arena_t           z64_game_arena;
@@ -2400,8 +2380,6 @@ void      z64_Actor_UpdateBgCheckInfo (z64_game_t *game, z64_actor_t *actor,
                                        float ceiling_check_height,
                                        int32_t flags);
 void      z64_DrawActors              (z64_game_t *game, void *actor_ctxt);
-void      z64_DeleteActor             (z64_game_t *game, void *actor_ctxt,
-                                       z64_actor_t *actor);
 void      z64_SpawnActor              (void *actor_ctxt, z64_game_t *game,
                                        uint16_t actor_id, float x, float y,
                                        float z, uint16_t rx, uint16_t ry,

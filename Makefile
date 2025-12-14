@@ -1,12 +1,13 @@
 PACKAGE_TARNAME      ?= gz
 PACKAGE_URL          ?= github.com/glankk/gz
 ifeq ($(origin PACKAGE_VERSION), undefined)
-PACKAGE_VERSION      := $(shell git describe --tags --dirty 2>/dev/null)
+PACKAGE_VERSION      := $(shell git describe --tags --match 'v[0-9]*' --dirty 2>/dev/null)
 ifeq ('$(PACKAGE_VERSION)', '')
 PACKAGE_VERSION       = Unknown version
 endif
 endif
-target                = mips64
+TARGET_TOOLS          = mips64-ultra-elf mips64
+target               := $(shell for i in $(TARGET_TOOLS); do if type $${i}-gcc >/dev/null 2>&1; then echo $${i}; break; fi done)
 program_prefix        = $(target)-
 AS                    = $(program_prefix)as
 CCAS                  = $(program_prefix)gcc -x assembler-with-cpp
@@ -19,17 +20,16 @@ NM                    = $(program_prefix)nm
 GENHOOKS              = AS='$(AS)' OBJCOPY='$(OBJCOPY)' NM='$(NM)' ./genhooks
 LUAPATCH              = luapatch
 GRC                   = AS='$(AS)' grc
-LDSCRIPT              = gl-n64.ld
-ALL_CPPFLAGS          = -DPACKAGE_TARNAME='$(PACKAGE_TARNAME)' -DPACKAGE_URL='$(PACKAGE_URL)' -DPACKAGE_VERSION='$(PACKAGE_VERSION)' -DF3DEX_GBI_2 $(CPPFLAGS)
-ALL_CFLAGS            = -std=gnu11 -Wall -ffunction-sections -fdata-sections -mno-check-zero-division $(CFLAGS)
-ALL_CXXFLAGS          = -std=gnu++14 -Wall -ffunction-sections -fdata-sections -mno-check-zero-division $(CXXFLAGS)
-ALL_LDFLAGS           = -T $(LDSCRIPT) -L$(LIBDIR) -nostartfiles -specs=nosys.specs -Wl,--gc-sections $(LDFLAGS)
+LDSCRIPT              = gz.ld
+ALL_CPPFLAGS          = -DPACKAGE_TARNAME='$(PACKAGE_TARNAME)' -DPACKAGE_URL='$(PACKAGE_URL)' -DPACKAGE_VERSION='$(PACKAGE_VERSION)' -DF3DEX_GBI_2 $(CPPFLAGS) $(EXTRA_CPPFLAGS)
+ALL_CFLAGS            = -std=gnu11 -Wall -ffunction-sections -fdata-sections -mno-check-zero-division $(CFLAGS) $(EXTRA_CFLAGS)
+ALL_CXXFLAGS          = -std=gnu++14 -Wall -ffunction-sections -fdata-sections -mno-check-zero-division $(CXXFLAGS) $(EXTRA_CXXFLAGS)
+ALL_LDFLAGS           = -T $(LDSCRIPT) -L$(LIBDIR) -nostartfiles -specs=nosys.specs -Wl,--gc-sections $(LDFLAGS) $(EXTRA_LDFLAGS)
 ALL_LDLIBS            = $(LDLIBS)
 LUAFILE               = $(EMUDIR)/Lua/patch-data.lua
 RESDESC               = $(RESDIR)/resources.json
 GZ_VERSIONS           = oot-gc-pal oot-gc-pal-vc
-GZ_ADDRESS            = 80400060
-LDR_ADDRESS           = 80000400
+GZ_ADDRESS            = 80400000
 SRCDIR                = src
 RESDIR                = res
 LIBDIR                = lib
@@ -101,6 +101,7 @@ OBJ-$(1)              = $$(ASMOBJ-$(1)) $$(COBJ-$(1)) $$(CXXOBJ-$(1)) $$(RESOBJ-
 DEPS-$(1)             = $$(patsubst %.o,%.d,$$(OBJ-$(1)))
 BIN-$(1)              = $$(BINDIR-$(1))/$$(NAME-$(1)).bin
 ELF-$(1)              = $$(BINDIR-$(1))/$$(NAME-$(1)).elf
+MAP-$(1)              = $$(BINDIR-$(1))/$$(NAME-$(1)).map
 BUILD-$(1)            = $(1)
 CLEAN-$(1)            = clean-$(1)
 -include $$(DEPS-$(1))
@@ -112,7 +113,7 @@ $$(CLEAN-$(1))        :
 $$(BIN-$(1))          : $$(ELF-$(1)) | $$(BINDIR-$(1))
 	$$(OBJCOPY) -S -O binary $$< $$@
 $$(ELF-$(1))          : $$(OBJ-$(1)) | $$(BINDIR-$(1))
-	$$(LD) $$(ALL_LDFLAGS) $$^ $$(ALL_LDLIBS) -o $$@
+	$$(LD) $$(ALL_LDFLAGS) $$^ $$(ALL_LDLIBS) -Wl,-Map,$$(MAP-$(1)) -o $$@
 $$(ASMOBJ-$(1))       : $$(OBJDIR-$(1))/%.o: $$(SRCDIR-$(1))/% | $$(OBJDIR-$(1))
 	$$(CCAS) -c -MMD -MP $$(ALL_CPPFLAGS) $$< -o $$@
 $$(COBJ-$(1))         : $$(OBJDIR-$(1))/%.o: $$(SRCDIR-$(1))/% | $$(OBJDIR-$(1))
@@ -185,11 +186,11 @@ $(OBJ-VC)             : ALL_CXXFLAGS         += -fno-reorder-blocks -fno-optimiz
 $(ELF-VC)             : ALL_LDFLAGS          += -fno-reorder-blocks -fno-optimize-sibling-calls
 endif
 
-$(OBJ-N64)            : CFLAGS               ?= -O2 -g -flto -ffat-lto-objects
-$(OBJ-N64)            : CXXFLAGS             ?= -O2 -g -flto -ffat-lto-objects
-$(ELF-N64)            : LDFLAGS              ?= -O2 -g -flto
-$(OBJ-VC)             : CFLAGS               ?= -Os -g -flto -ffat-lto-objects
-$(OBJ-VC)             : CXXFLAGS             ?= -Os -g -flto -ffat-lto-objects
-$(ELF-VC)             : LDFLAGS              ?= -Os -g -flto
+$(OBJ-N64)            : CFLAGS               ?= -O2 -g -flto=auto
+$(OBJ-N64)            : CXXFLAGS             ?= -O2 -g -flto=auto
+$(ELF-N64)            : LDFLAGS              ?= -O2 -g -flto=auto
+$(OBJ-VC)             : CFLAGS               ?= -Os -g -flto=auto
+$(OBJ-VC)             : CXXFLAGS             ?= -Os -g -flto=auto
+$(ELF-VC)             : LDFLAGS              ?= -Os -g -flto=auto
 
 $(eval $(call bin_template,ldr,ldr,$(SRCDIR)/ldr,$(RESDIR)/ldr,$(OBJDIR)/ldr,$(BINDIR)/ldr,$(HOOKDIR)/ldr,$(LDR_ADDRESS)))
