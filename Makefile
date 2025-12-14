@@ -48,6 +48,7 @@ OBJ-OOT-MQ-U          = $(OBJ-gz-oot-mq-u) $(OBJ-gz-oot-mq-u-vc)
 OBJ-OOT-GC-J          = $(OBJ-gz-oot-gc-j) $(OBJ-gz-oot-gc-j-vc)
 OBJ-OOT-GC-U          = $(OBJ-gz-oot-gc-u) $(OBJ-gz-oot-gc-u-vc)
 OBJ-OOT-CE-J          = $(OBJ-gz-oot-ce-j) $(OBJ-gz-oot-ce-j-vc)
+OBJ-OOT-IQUE-CN       = $(OBJ-gz-oot-ique-cn)
 OBJ-OOT-GC-PAL        = $(OBJ-gz-oot-gc-pal) $(OBJ-gz-oot-gc-pal-vc)
 ELF-OOT-1.0           = $(ELF-gz-oot-1.0) $(ELF-gz-oot-1.0-vc)
 ELF-OOT-1.1           = $(ELF-gz-oot-1.1) $(ELF-gz-oot-1.1-vc)
@@ -58,6 +59,7 @@ ELF-OOT-GC-J          = $(ELF-gz-oot-gc-j) $(ELF-gz-oot-gc-j-vc)
 ELF-OOT-GC-U          = $(ELF-gz-oot-gc-u) $(ELF-gz-oot-gc-u-vc)
 ELF-OOT-CE-J          = $(ELF-gz-oot-ce-j) $(ELF-gz-oot-ce-j-vc)
 ELF-OOT-GC-PAL		  = $(ELF-gz-oot-gc-pal) $(ELF-gz-oot-gc-pal-vc)
+ELF-OOT-IQUE-CN       = $(ELF-gz-oot-ique-cn)
 OBJ-N64               = $(OBJ-gz-oot-1.0) $(OBJ-gz-oot-1.1) $(OBJ-gz-oot-1.2) $(OBJ-gz-oot-mq-j) $(OBJ-gz-oot-mq-u) $(OBJ-gz-oot-gc-j) $(OBJ-gz-oot-gc-u) $(OBJ-gz-oot-ce-j) $(OBJ-gz-oot-gc-pal)
 OBJ-VC                = $(OBJ-gz-oot-1.0-vc) $(OBJ-gz-oot-1.1-vc) $(OBJ-gz-oot-1.2-vc) $(OBJ-gz-oot-mq-j-vc) $(OBJ-gz-oot-mq-u-vc) $(OBJ-gz-oot-gc-j-vc) $(OBJ-gz-oot-gc-u-vc) $(OBJ-gz-oot-ce-j-vc) $(OBJ-gz-oot-gc-pal-vc)
 ELF-N64               = $(ELF-gz-oot-1.0) $(ELF-gz-oot-1.1) $(ELF-gz-oot-1.2) $(ELF-gz-oot-mq-j) $(ELF-gz-oot-mq-u) $(ELF-gz-oot-gc-j) $(ELF-gz-oot-gc-u) $(ELF-gz-oot-ce-j) $(ELF-gz-oot-gc-pal)
@@ -165,6 +167,7 @@ $(OBJ-OOT-MQ-U)       : ALL_CPPFLAGS         += -DZ64_VERSION=Z64_OOTMQU
 $(OBJ-OOT-GC-J)       : ALL_CPPFLAGS         += -DZ64_VERSION=Z64_OOTGCJ
 $(OBJ-OOT-GC-U)       : ALL_CPPFLAGS         += -DZ64_VERSION=Z64_OOTGCU
 $(OBJ-OOT-CE-J)       : ALL_CPPFLAGS         += -DZ64_VERSION=Z64_OOTCEJ
+$(OBJ-OOT-IQUE-CN)    : ALL_CPPFLAGS         += -DZ64_VERSION=Z64_OOTIQC
 $(OBJ-OOT-GC-PAL)     : ALL_CPPFLAGS         += -DZ64_VERSION=Z64_OOTGCPAL
 $(ELF-OOT-1.0)        : ALL_LDLIBS           += -loot-1.0
 $(ELF-OOT-1.1)        : ALL_LDLIBS           += -loot-1.1
@@ -174,6 +177,7 @@ $(ELF-OOT-MQ-U)       : ALL_LDLIBS           += -loot-mq-u
 $(ELF-OOT-GC-J)       : ALL_LDLIBS           += -loot-gc-j
 $(ELF-OOT-GC-U)       : ALL_LDLIBS           += -loot-gc-u
 $(ELF-OOT-CE-J)       : ALL_LDLIBS           += -loot-ce-j
+$(ELF-OOT-IQUE-CN)    : ALL_LDLIBS           += -loot-ique-cn
 $(ELF-OOT-GC-PAL)     : ALL_LDLIBS           += -loot-gc-pal
 ifeq '$(shell $(CC) -dumpmachine 2>/dev/null)' 'mips64-ultra-elf'
 $(OBJ-VC)             : ALL_CFLAGS           += -n64-wiivc

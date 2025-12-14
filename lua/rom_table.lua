@@ -252,6 +252,7 @@ rom_table =
                     data_dir    = "oot-gc-pal",
                     gz_version  = "oot-gc-pal" .. version_suffix,
                     gz_name     = "gz-oot-gc-pal" .. version_suffix,
+                    patches     = { "mem_patch", "ups_size_patch" },
                     title_id    = "NGPL",
                   },
 [0xF45C5532]    = {
