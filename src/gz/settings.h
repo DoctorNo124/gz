@@ -16,7 +16,7 @@
 #define SETTINGS_TELEPORT_MAX       9
 #define SETTINGS_STATE_MAX          3
 #define SETTINGS_BIND_MAX           COMMAND_MAX
-#define SETTINGS_LOG_MAX            10
+#define SETTINGS_LOG_MAX            4
 
 #define SETTINGS_LAG_FRAMES         0
 #define SETTINGS_LAG_SECONDS        1
