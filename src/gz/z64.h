@@ -57,7 +57,7 @@ struct z64_arena
       Z64_VERSION == Z64_OOTGCJ || \
       Z64_VERSION == Z64_OOTGCU || \
       Z64_VERSION == Z64_OOTCEJ || \
-      Z64_VERSION == Z64_OOTGCPAL || \
+      Z64_VERSION == Z64_OOTGCEU || \
       Z64_VERSION == Z64_OOTIQC
                                               /* 0x0008 */
 #endif
@@ -86,7 +86,7 @@ struct z64_arena_node
       Z64_VERSION == Z64_OOTGCJ || \
       Z64_VERSION == Z64_OOTGCU || \
       Z64_VERSION == Z64_OOTCEJ || \
-      Z64_VERSION == Z64_OOTGCPAL || \
+      Z64_VERSION == Z64_OOTGCEU || \
       Z64_VERSION == Z64_OOTIQC
   char              data[];                   /* 0x0010 */
 #endif
@@ -2193,7 +2193,7 @@ typedef struct
 # define z64_vr_TTVR_pal_static                 1001
 # define z64_vr_FCVR_static                     1002
 # define z64_vr_FCVR_pal_static                 1003
-#elif Z64_VERSION == Z64_OOTGCPAL
+#elif Z64_VERSION == Z64_OOTGCEU
 # define z64_icon_item_static                   7
 # define z64_icon_item_24_static                8
 # define z64_icon_item_field_static             9

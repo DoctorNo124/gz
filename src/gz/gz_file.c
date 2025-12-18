@@ -22,7 +22,7 @@
 #define LANGS "japanese\0""english\0"
 #elif Z64_VERSION == Z64_OOTIQC
 #define LANGS "japanese\0""chinese\0"
-#elif Z64_VERSION == Z64_OOTGCPAL 
+#elif Z64_VERSION == Z64_OOTGCEU 
 #define LANGS "english\0""french\0""german\0"
 #endif
 
