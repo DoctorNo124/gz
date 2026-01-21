@@ -3,6 +3,7 @@ require("lua/rom_table")
 local arg = {...}
 local rom = gru.n64rom_load(arg[1])
 local rom_info = rom_table[rom:crc32()]
+print(rom:crc32())
 if rom_info == nil then return nil end
 
 local gz_version = rom_info.gz_version

@@ -234,7 +234,7 @@ rom_table =
                     patches     = { "mem_patch", "ups_size_patch" },
                     title_id    = "NGEJ",
                   },
-[0xF45C5532]    = {
+  [0xF45C5532]    = {
                     game        = "oot",
                     version     = "ique",
                     region      = "cn",
@@ -254,6 +254,27 @@ rom_table =
                     gz_name     = "gz-oot-ique-cn" .. version_suffix,
                     patches     = { "mem_patch", "hungup_patch" },
                     title_id    = "NGBC",
+                  },
+  [0x946FD0F7]    = {  -- TODO: Replace with actual PAL 1.0 CRC32
+                    game        = "oot",
+                    version     = "1.0",
+                    region      = "eu",
+                    boot_ind    = 1,
+                    boot_ram    = 0x80000460,
+                    code_ind    = 28,  -- Line 29 in CSV, index 28
+                    code_ram    = 0x800116E0,
+                    ovl_tbls    = {
+                                    part      = { addr = 0x800E5B90 },
+                                    actor     = { addr = 0x800E6480 },
+                                    state     = { addr = 0x800EF290 },
+                                    map_mark  = { addr = 0x800EFB48 },
+                                    play      = { addr = 0x800FC3D0 },
+                                  },
+                    data_dir    = "oot-1.0",
+                    gz_version  = "oot-1.0-eu" .. version_suffix,
+                    gz_name     = "gz-oot-1.0-eu" .. version_suffix,
+                    patches     = { "mem_patch", "ups_size_patch" },
+                    title_id    = "NG0P",
                   },
 }
 
