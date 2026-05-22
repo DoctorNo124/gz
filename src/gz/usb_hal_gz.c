@@ -44,6 +44,7 @@
 #include <stdint.h>
 #include <n64.h>
 #include "usb_hal.h"
+#include "util.h"   /* maybe_init_gp() — required at thread entry */
 
 /* iQue libultra adds these event slots beyond glankk's <n64/message.h>
  * range (0..14). Values from thar0-ultralib/include/PR/os_message.h. */
@@ -96,6 +97,13 @@ static usb_hal_isr_fn_t  s_isr_fn[2];
 
 static void isr_thread_entry(void *arg)
 {
+    /* gz places statics in .sdata/.sbss and accesses them gp-relative.
+     * Each thread must initialize its $gp before touching any global
+     * (otherwise the first gp-relative load faults — observed live as a
+     * TLB-load exception on a sign-extended-from-zero offset). Same
+     * pattern rdb_main uses at rdb.c:664. */
+    maybe_init_gp();
+
     int port = (int)(uintptr_t)arg;
     for (;;) {
         OSMesg m;
