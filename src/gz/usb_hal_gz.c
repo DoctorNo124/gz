@@ -110,6 +110,13 @@ static void isr_thread_entry(void *arg)
         osRecvMesg(&s_isr_mq[port], &m, OS_MESG_BLOCK);
         if (s_isr_fn[port] != NULL)
             s_isr_fn[port]();
+        /* iQue libultra's MI/RCP dispatcher MASKS the USB MI bit after
+         * posting the event (write of MI_USBn_CLR to MI_BB_MASK; see
+         * thar0-ultralib src/os/exceptasm.s:675-697). The driver only
+         * gets ONE interrupt unless we re-arm it. Without this re-enable
+         * we saw exactly attach_count=1, tokdne_count=0 — ATTACH fired
+         * once, every subsequent TOKDNE was silently swallowed. */
+        usb_hal_irq_enable(port, true);
     }
 }
 

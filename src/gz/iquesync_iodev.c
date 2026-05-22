@@ -63,13 +63,24 @@ static int iquesync_disk_init(void)
     if (vusbh11_init(IQUESYNC_HOST_PORT) != VUSB11_OK)
         return -1;
 
-    /* Wait for the bottom-half to finish: ATTACH fires, process_attach
-     * does bus reset → speed detect → Chapter-9 enum → INQUIRY/TUR/
-     * READ_CAPACITY, then publishes vusbh11_block_size/count. */
+    /* Force a fresh re-enumeration on every disk_init. Stale geometry
+     * from a previous drive (e.g. you ran with an SD card reader, then
+     * swapped to a USB stick) would otherwise be reused — gz's FAT
+     * layer would then read the new drive's bytes through the old
+     * drive's BPB/cluster math and show garbage / empty directories.
+     *
+     * We clear geometry and signal attach_pending so process_attach
+     * runs again. process_attach handles "device present" and "device
+     * gone" cases (in the gone case, speed-detect fails and the wait
+     * loop times out → ENODEV). */
+    vusbh11_telem.block_size  = 0;
+    vusbh11_telem.block_count = 0;
+    vusbh11_telem.attach_pending = true;
+
     uint32_t waited = 0;
     while (waited < IQUESYNC_ATTACH_TIMEOUT_MS) {
         vusbh11_poll();
-        if (vusbh11_block_size == 512 && vusbh11_block_count > 0)
+        if (vusbh11_telem.block_size == 512 && vusbh11_telem.block_count > 0)
             return 0;
         usb_hal_wait_ms(50);
         waited += 50;

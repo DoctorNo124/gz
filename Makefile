@@ -194,3 +194,27 @@ $(OBJ-VC)             : CXXFLAGS             ?= -Os -g -flto=auto
 $(ELF-VC)             : LDFLAGS              ?= -Os -g -flto=auto
 
 $(eval $(call bin_template,ldr,ldr,$(SRCDIR)/ldr,$(RESDIR)/ldr,$(OBJDIR)/ldr,$(BINDIR)/ldr,$(HOOKDIR)/ldr,$(LDR_ADDRESS)))
+
+# Print the current address of the iquesync USB-host telemetry block.
+# Address shifts per build (BSS layout). Auto-printed as a post-step
+# of `gz-oot-ique-cn` so you don't have to remember to run this.
+.PHONY: show-telem-addr
+show-telem-addr:
+	@addr=$$(mips64-ultra-elf-nm bin/gz/oot-ique-cn/gz.elf 2>/dev/null \
+	         | awk '$$3 == "vusbh11_telem" {print $$1}') ; \
+	if [ -z "$$addr" ]; then \
+	  echo "vusbh11_telem not found — build gz-oot-ique-cn first." ; \
+	  exit 1 ; \
+	fi ; \
+	echo "" ; \
+	echo "  =========================================================" ; \
+	echo "  USB telemetry @ 0x$$addr" ; \
+	echo "  Point gz's memory viewer here. Layout in vusbh11.h." ; \
+	echo "  =========================================================" ; \
+	echo ""
+
+# Auto-print the address after every iQue build.
+gz-oot-ique-cn: post-show-telem-addr
+.PHONY: post-show-telem-addr
+post-show-telem-addr: $(BIN-gz-oot-ique-cn)
+	@$(MAKE) --no-print-directory show-telem-addr
