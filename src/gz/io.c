@@ -26,6 +26,10 @@ static void cpu_reset_dflt(void)
 
 static struct iodev *current_dev;
 
+#if Z64_VERSION == Z64_OOTIQC
+extern struct iodev iquesync_iodev;
+#endif
+
 int io_init(void)
 {
   struct iodev *devs[] = {
@@ -44,6 +48,13 @@ int io_init(void)
         return 0;
     }
   }
+#if Z64_VERSION == Z64_OOTIQC
+  else {
+    current_dev = &iquesync_iodev;
+    if (current_dev->probe() == 0)
+      return 0;
+  }
+#endif
 
   current_dev = NULL;
   errno = ENODEV;
