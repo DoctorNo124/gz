@@ -74,11 +74,14 @@ vusb11_status_t vusb11_hw_enable(void)
                     (unsigned long)pi_allowed);
     }
 
-    /* SA1's boot path writes 0x01000000 to MI 0x3C before any USB code.
-     * In libdragon's MI_BB_MASK encoding that's MI_BB_WMASK_CLR_BTN (clear
-     * power-button mask) — *not* a global USB enable. Kept here purely to
-     * mirror SA1's known-good sequence; harmless in practice. */
-    usb_hal_io_write(MI_HW_INTR_MASK_REG, MI_USB_GLOBAL_EN_BIT);
+    /* (Originally we wrote 0x01000000 to MI 0x3C here "to mirror SA1's
+     * known-good sequence". In libdragon's MI_BB_MASK encoding that's
+     * MI_BB_WMASK_CLR_BTN — which CLEARS THE POWER-BUTTON IRQ MASK.
+     * SA1 doesn't care because it owns the box; gz running under OoT
+     * absolutely needs the power button to keep working so the user
+     * can shut down. Confirmed live: with this write present, the
+     * iQue power button becomes unresponsive after any USB activity
+     * and the user has to pull the AC cord. Removed.) */
 
     /* SA1's __usbHwInit unconditionally writes 1 to BOTH wrapper STATUS
      * registers (USB0 at 0xA4940010 and USB1 at 0xA4A40010) regardless of
