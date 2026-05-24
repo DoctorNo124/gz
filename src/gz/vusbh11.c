@@ -819,20 +819,12 @@ static void port_bringup(uint32_t pre_reset_settle_ms,
     /* === Step 4: ADDR = FSEN | 0 (device default address) === */
     vusb11_write(s_port, VUSB11_OFF_ADDR, VUSB11_ADDR_FSEN | 0u);
 
-    /* === Step 5: EP_CTL[0] = HSHK_EN | RX_EN | TX_EN ===
-     * Configure endpoint BEFORE reset so when device comes out of reset
-     * it sees a fully-configured host.
-     *
-     * RETRY_DIS DELIBERATELY CLEARED. Theory: on the iQue's K20-derived
-     * SIE, RETRY_DIS may prevent the BUSTIMEOUT timer from firing when
-     * the device doesn't respond — symptom is TX_SUSPEND_BUSY stuck SET
-     * forever after a SETUP that gets no response, wedging all
-     * subsequent retries. Cold boot works because the device DOES
-     * respond, so we never hit BUSTIMEOUT path. After reset-disk the
-     * device is in a confused state and doesn't respond → wedge.
-     * Without RETRY_DIS the SIE will auto-retry NAKs internally (which
-     * we don't see for SETUP anyway) AND honor BUSTIMEOUT properly. */
+    /* === Step 5: EP_CTL[0] = RETRY_DIS | HSHK_EN | RX_EN | TX_EN ===
+     * Matches thar0's vusbh11ma.c:298 (process_attach) — set on every
+     * EP0 reconfig. Configure endpoint BEFORE reset so when device
+     * comes out of reset it sees a fully-configured host. */
     vusb11_write(s_port, VUSB11_OFF_EP_CTL_BASE + 0u * 4u,
+                 VUSB11_EP_RETRY_DIS |
                  VUSB11_EP_HSHK_EN | VUSB11_EP_RX_EN | VUSB11_EP_TX_EN);
 
     /* === Step 6-7: bus reset (SE0 hold) ===
@@ -893,19 +885,8 @@ static void port_bringup(uint32_t pre_reset_settle_ms,
     s_tx_tokdne_pending = 0;
 }
 
-__attribute__((unused))
-static void retry_recovery_hard(void)
-{
-    /* Retry path — device should be alive but possibly wedged. Use
-     * thar0's minimum-viable timings; if it doesn't recover, an outer
-     * loop will call us again. */
-    port_bringup(50, 10, 50);
-}
-
-/* Public hub-level port reset. See vusbh11.h.
- * Slightly longer pre-settle than retry_recovery_hard since this is
- * called when the previous enum just failed — give the device a beat
- * to fully resettle before the next attempt. */
+/* Public hub-level port reset. See vusbh11.h. 100ms pre-settle gives
+ * the device a beat to fully resettle before the next attempt. */
 void vusbh11_port_reset(void)
 {
     port_bringup(100, 10, 50);
@@ -1439,12 +1420,13 @@ static void issue_token(uint8_t token_byte)
         usb_hal_log("vusbh11: TX_SUSPEND_BUSY stuck before TOKEN=%02x\n", token_byte);
         return;
     }
-    /* EP0 control = 0x0D (HSHK_EN | RX_EN | TX_EN, NO RETRY_DIS).
-     * RETRY_DIS was theorized to prevent BUSTIMEOUT firing → SIE wedge
-     * when device doesn't respond (e.g. after reset-disk leaves device
-     * in confused state). Cleared throughout to keep behavior consistent
-     * with port_bringup. */
+    /* EP0 control = 0x4D (RETRY_DIS | HSHK_EN | RX_EN | TX_EN).
+     * Matches thar0's vusbh11ma.c:344-345/372-373 (send_in_token/
+     * send_out_token) — every token issue rewrites EP0 with this
+     * value. No HOST_WO_HUB; that bit is for LOW-speed direct attach
+     * and causes BUSTIMEOUT on FS. */
     vusb11_write(s_port, VUSB11_OFF_EP_CTL_BASE + 0u,
+                 VUSB11_EP_RETRY_DIS |
                  VUSB11_EP_HSHK_EN | VUSB11_EP_RX_EN | VUSB11_EP_TX_EN);
     /* Always re-write ADDRESS per Thar0's send_token pattern. The bit 7
      * (LSEN) stays 0 for full-speed; bits 6:0 carry the device address. */

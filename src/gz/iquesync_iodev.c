@@ -75,38 +75,28 @@ static int iquesync_disk_init(void)
      * and re-enables MI without recreating the bridge thread. */
     usb_hal_irq_rearm(IQUESYNC_HOST_PORT);
 
-    /* Multi-attempt enumeration. Sniffer confirmed (via D+ activity
-     * patterns showing massive bus-reset hammering + telemetry's
-     * BUSTIMEOUT history on all SETUP retries) that cold-boot first
-     * try often fails because the USB drive's internal USB MCU isn't
-     * fully booted yet. Real flash drives need 1-2 sec after VBUS
-     * rise before they can respond to SETUPs.
-     *
-     * Each attempt's process_attach has 2000ms pre_reset_settle, so
-     * total cold-boot worst case is ENUM_TRIES × (~5sec) = ~15 sec
-     * before "no disk" displays. Brief 500ms pause between attempts
-     * gives the device extra time to recover from any partial state. */
-    enum { ENUM_TRIES = 3 };
-    for (int try = 0; try < ENUM_TRIES; try++) {
-        if (try > 0) {
-            usb_hal_log("iquesync_disk_init: retry attempt %d/%d\n",
-                        try + 1, ENUM_TRIES);
-            usb_hal_wait_ms(500);
-        }
+    /* Single-shot enumeration, matching thar0's event-driven design.
+     * Retries live where they can actually help:
+     *   - SIE hardware (RETRY_DIS cleared) handles transient NAKs
+     *   - process_attach's SETUP retry loop (10 attempts with
+     *     retry_recovery_soft between) handles a flaky-but-present
+     *     device's enumeration
+     * The earlier outer 3-attempt loop existed to work around two
+     * separate bugs (cold-boot device-warmup; reset-disk re-init) that
+     * are now fixed at their root — the 2000ms pre_reset_settle in
+     * process_attach and the split-idempotency vusbh11_init. With
+     * those, an extra round of port_bringup adds nothing. */
+    vusbh11_telem.block_size  = 0;
+    vusbh11_telem.block_count = 0;
+    vusbh11_telem.attach_pending = true;
 
-        vusbh11_telem.block_size  = 0;
-        vusbh11_telem.block_count = 0;
-        vusbh11_telem.attach_pending = true;
-
-        uint32_t waited = 0;
-        while (waited < IQUESYNC_ATTACH_TIMEOUT_MS) {
-            vusbh11_poll();
-            if (vusbh11_telem.block_size == 512 && vusbh11_telem.block_count > 0)
-                return 0;
-            usb_hal_wait_ms(50);
-            waited += 50;
-        }
-        /* Timed out — loop to next try if available. */
+    uint32_t waited = 0;
+    while (waited < IQUESYNC_ATTACH_TIMEOUT_MS) {
+        vusbh11_poll();
+        if (vusbh11_telem.block_size == 512 && vusbh11_telem.block_count > 0)
+            return 0;
+        usb_hal_wait_ms(50);
+        waited += 50;
     }
     return -1;
 }
