@@ -151,9 +151,29 @@ void usb_hal_irq_enable(int port, bool on)
 
 void usb_hal_log(const char *fmt, ...)
 {
-    /* No PC-side log channel in gz on iQue without an RDB host attached.
-     * Stub for now; wire to printf() for debug builds if needed. */
-    (void)fmt;
+    /* Route to libultra's osSyncPrintf, which on iQue SK firmware
+     * pushes bytes over the consumer-cable USB0 device interface.
+     * aulon2 on the PC sees them as console output, so every
+     * usb_hal_log(...) line in vusbh11.c shows up live. Same pattern
+     * iquesync-host uses (src/usb_hal_libultra.c:133).
+     *
+     * osSyncPrintf is variadic with no vprintf-style entry, so format
+     * into a local buffer first and pass that as a literal "%s". 512
+     * bytes covers all our log lines (longest is the BDT dump). */
+    char buf[512];
+    va_list ap;
+    va_start(ap, fmt);
+    /* libultra ships its own vsprintf in libgultra (xstdio). */
+    extern int vsprintf(char *str, const char *format, va_list ap);
+    int n = vsprintf(buf, fmt, ap);
+    va_end(ap);
+    if (n < 0) return;
+    if (n >= (int)sizeof(buf)) buf[sizeof(buf) - 1] = '\0';
+    /* iQue libultra signature. glankk's n64 headers don't declare it,
+     * but it's present in liboot-ique-cn.a — declare here to satisfy
+     * the compiler. */
+    extern void osSyncPrintf(const char *fmt, ...);
+    osSyncPrintf("%s", buf);
 }
 
 #endif /* Z64_VERSION == Z64_OOTIQC */

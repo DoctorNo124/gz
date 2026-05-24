@@ -28,11 +28,12 @@
 #include "vusbh11.h"
 
 #ifndef IQUESYNC_HOST_PORT
-/* USB0 = consumer cable. With no breakout / no OTG cable physically
- * forcing host mode via the ID pin, gz's USB code will probably never
- * see an ATTACH on USB0 — it's wired for device mode. USB1 is the dev
- * cable / breakout port and is the natural choice for host. */
-#define IQUESYNC_HOST_PORT  VUSB11_PORT_USB1
+/* USB0 = consumer cable. Empirically the working host port on this
+ * iQue — USB1 (dev cable / breakout) didn't enumerate devices even
+ * with code that was otherwise correct. Likely a hardware issue on
+ * the USB1 path (breakout PCB, cable, or controller). USB0 works
+ * reliably as host with the device plugged into the consumer port. */
+#define IQUESYNC_HOST_PORT  VUSB11_PORT_USB0
 #endif
 
 #ifndef IQUESYNC_ATTACH_TIMEOUT_MS
@@ -59,20 +60,15 @@ static int iquesync_disk_init(void)
         return -1;
 
     /* Bring up the host driver on the chosen port. Installs the ISR
-     * bridge thread and unmasks ATTACHEN. */
+     * bridge thread and unmasks ATTACHEN. Idempotent: subsequent calls
+     * are no-ops after the first successful init. */
     if (vusbh11_init(IQUESYNC_HOST_PORT) != VUSB11_OK)
         return -1;
 
-    /* Force a fresh re-enumeration on every disk_init. Stale geometry
-     * from a previous drive (e.g. you ran with an SD card reader, then
-     * swapped to a USB stick) would otherwise be reused — gz's FAT
-     * layer would then read the new drive's bytes through the old
-     * drive's BPB/cluster math and show garbage / empty directories.
-     *
-     * We clear geometry and signal attach_pending so process_attach
-     * runs again. process_attach handles "device present" and "device
-     * gone" cases (in the gone case, speed-detect fails and the wait
-     * loop times out → ENODEV). */
+    /* Inlined polling loop matching HEAD byte-for-byte. (Was a helper
+     * try_enumerate(); inlined to rule out any compiler/codegen
+     * differences vs HEAD.) Force fresh re-enumeration on every
+     * disk_init by clearing geometry and setting attach_pending. */
     vusbh11_telem.block_size  = 0;
     vusbh11_telem.block_count = 0;
     vusbh11_telem.attach_pending = true;

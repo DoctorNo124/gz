@@ -137,6 +137,48 @@ typedef struct {
      *   0xE = STALL */
     uint32_t last_setup_w0;
     uint32_t first_setup_retries;
+    /* BOMSR (Bulk-Only Mass Storage Reset) recovery counters.
+     * `bomsr_attempts` increments each time a disk_read/write fails
+     * and we attempt recovery. `bomsr_successes` increments only if
+     * the BOMSR control transfers all complete cleanly. The diff is
+     * the count of unrecoverable failures (returned as I/O error). */
+    uint32_t bomsr_attempts;
+    uint32_t bomsr_successes;
+    /* Per-retry diagnostics for the first GET_DESC SETUP — captures
+     * state for each of the up-to-5 attempts so we can see WHY a
+     * cold-boot enum intermittently fails. Each entry is 4 bytes
+     * packed:
+     *   byte 0: CTL register just before issuing TOKEN
+     *           (bit 7 = JSTATE, bit 6 = SE0, bit 3 = HOST_MODE_EN,
+     *            bit 0 = USB_EN)
+     *   byte 1: ERRSTAT just after TOKDNE / timeout
+     *           (bit 4 = BTOERR, bit 7 = BTSERR, bit 5 = DMAERR)
+     *   byte 2: PID from BDT writeback (0x2=ACK, 0xA=NAK,
+     *           0xE=STALL, 0x0=BUSTIMEOUT, 0xFF=wait_for_completion timeout)
+     *   byte 3: outcome flag (0 = failed, 1 = success ACK)
+     * Slots beyond the actual retry count stay 0. */
+    uint8_t  setup_retry_log[5][4];
+    /* ===== Pong-state forensics =====
+     * sw_rx/tx_next_pong: snapshots of s_rx_next_pong / s_tx_next_pong
+     * after the ISR last advanced them. Read live to see "where SW thinks
+     * the next token should be primed". Compare against last_tokdne_stat
+     * bit 2 (ODD) to verify HW agrees with SW.
+     *
+     * recent_tokens: ring of the last 8 token transactions. Each entry
+     * captures pong-at-issue (what SW believed when it wrote the BDT
+     * slot) + the resulting PID. Detects pong desync: if pong-at-issue
+     * is 0 but TOKDNE doesn't fire (pid_back = 0xFE), HW pong was Odd
+     * and we wrote to the wrong slot. */
+    uint8_t  sw_rx_next_pong;
+    uint8_t  sw_tx_next_pong;
+    uint8_t  recent_tokens_head;   /* 0..7, next write slot */
+    uint8_t  _pad_pong;
+    struct {
+        uint8_t  pong;        /* 0=Even, 1=Odd; SW pong at issue */
+        uint8_t  dir_ep;      /* bit 7 = 1 if TX, 0 if RX; bits 3:0 = ep */
+        uint8_t  pid_back;    /* PID nibble; 0xFE = no TOKDNE */
+        uint8_t  token_type;  /* 0=SETUP 1=IN 2=OUT 3=STATUS_IN 4=STATUS_OUT */
+    } recent_tokens[8];
 } vusbh11_telem_t;
 
 #define VUSBH11_TELEM_ADDR  0x803F0000u
@@ -145,6 +187,18 @@ extern volatile vusbh11_telem_t vusbh11_telem;
 
 vusb11_status_t vusbh11_init(vusb11_port_t port);
 void            vusbh11_shutdown(void);
+
+/* Hub-level port reset. Drives a full SE0 reset cycle + re-runs the
+ * controller-side bringup (clears BDT, re-writes EP_CTL/ADDR, re-arms
+ * interrupts). Use this as the escalation when normal enumeration fails
+ * — e.g. after the device went into selective suspend during idle.
+ * Mirrors Linux's hub_port_reset(): heavy-handed but unblocks devices
+ * that aren't responding to control transfers.
+ *
+ * Caller should then re-trigger enumeration (set attach_pending and
+ * pump vusbh11_poll). Geometry cache (block_size/block_count) is left
+ * untouched so the caller can decide whether to invalidate it. */
+void            vusbh11_port_reset(void);
 
 /*
  * Main-loop pump. Call as often as you can (every iteration) to drive

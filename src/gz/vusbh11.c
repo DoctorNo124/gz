@@ -6,6 +6,7 @@
 #endif
 #include <stdbool.h>
 #include <stdint.h>
+#include <string.h>
 #include "usb_hal.h"
 #include "vusb11.h"
 #include "vusbh11.h"
@@ -109,6 +110,23 @@ volatile vusbh11_telem_t vusbh11_telem;
  * keep ELF size small. */
 static void telem_reset(void)
 {
+    /* Zero the whole struct so each process_attach call gives clean
+     * per-attempt forensics. Without this, counters (tokdne_count,
+     * isr_count, etc) and the recent_tokens ring accumulate across
+     * multiple disk_init invocations, making it impossible to tell
+     * which TOKDNEs belong to which attempt.
+     *
+     * Cast through (void*) to drop volatile — memset on volatile
+     * objects triggers -Wcast-qual but is correct here because we
+     * own the struct during reset (no ISR can fire mid-call: this
+     * runs as the first thing in process_attach, ISR for USB is
+     * still serviced but its only writes are to fields we'll
+     * immediately rewrite). */
+    memset((void *)&vusbh11_telem, 0, sizeof(vusbh11_telem));
+
+    /* Sentinel values for "not yet run" fields — distinct from BSS-zero
+     * so the memory viewer can tell apart "not attempted" from
+     * "attempted, status=0". */
     vusbh11_telem.read_cap_status    = 0xEE;
     vusbh11_telem.tur_status         = 0xEE;
     vusbh11_telem.inquiry_status     = 0xEE;
@@ -149,6 +167,41 @@ static void telem_reset(void)
 #define vusbh11_phase             vusbh11_telem.phase
 #define vusbh11_last_setup_w0     vusbh11_telem.last_setup_w0
 #define vusbh11_first_setup_retries vusbh11_telem.first_setup_retries
+#define vusbh11_bomsr_attempts    vusbh11_telem.bomsr_attempts
+#define vusbh11_bomsr_successes   vusbh11_telem.bomsr_successes
+
+/* Per-token recorder. Called by each do_*_phase right after wait_for_completion
+ * returns. Push one entry into the 8-deep ring with the SW pong used at
+ * issue + the resulting PID. token_type/dir/ep are for human readability.
+ *
+ * PID encoding in pid_back:
+ *   0x2 = ACK, 0xA = NAK, 0xE = STALL, 0x3/0xB = DATA0/DATA1 (IN response),
+ *   0x0 = BUSTIMEOUT (TOKDNE fired but no device response),
+ *   0xFE = wait_for_completion timed out, no TOKDNE fired at all
+ *          (HW pong probably mismatched SW → token never issued). */
+#define VUSBH11_TT_SETUP       0
+#define VUSBH11_TT_IN          1
+#define VUSBH11_TT_OUT         2
+#define VUSBH11_TT_STATUS_IN   3
+#define VUSBH11_TT_STATUS_OUT  4
+
+static void telem_record_token(uint8_t token_type, uint8_t dir_tx, uint8_t ep,
+                               uint8_t pong_at_issue, uint32_t w0,
+                               uint32_t tokdne_before)
+{
+    uint8_t pid;
+    if (vusbh11_telem.tokdne_count == tokdne_before) {
+        pid = 0xFE;  /* no TOKDNE — pong desync or controller wedged */
+    } else {
+        pid = (uint8_t)(((w0 >> 24) >> 2) & 0xFu);
+    }
+    uint8_t i = vusbh11_telem.recent_tokens_head & 0x7u;
+    vusbh11_telem.recent_tokens[i].pong       = pong_at_issue;
+    vusbh11_telem.recent_tokens[i].dir_ep     = (uint8_t)((dir_tx ? 0x80u : 0u) | (ep & 0xFu));
+    vusbh11_telem.recent_tokens[i].pid_back   = pid;
+    vusbh11_telem.recent_tokens[i].token_type = token_type;
+    vusbh11_telem.recent_tokens_head = (uint8_t)((i + 1u) & 0x7u);
+}
 
 /* ----- BDT in controller MMIO (+0x80000 region) -----
  *
@@ -392,6 +445,17 @@ static void host_mode(vusb11_port_t port)
 
 vusb11_status_t vusbh11_init(vusb11_port_t port)
 {
+    /* Idempotent: gz's iquesync_disk_init calls this on every "import
+     * state" / "reset disk" / etc. The first call creates the ISR
+     * bridge thread (usb_hal_irq_install → osCreateThread). A second
+     * call would osCreateThread *into the same OSThread struct* while
+     * the existing thread is blocked on osRecvMesg — corrupting
+     * libultra's __osActiveQueue linkage and crashing later (observed
+     * as a TLB store fault in load_state, kuseg VA, USB CTL register
+     * still parked in T1). Skip re-init if already up. */
+    if (s_initted)
+        return VUSB11_OK;
+
     s_port = port;
 
     /* Register handlers BEFORE making the controller capable of firing
@@ -465,6 +529,18 @@ static void write_setup_packet(const uint8_t pkt[8])
  * based on STAT's IN bit, so this just polls the right flag. */
 static uint32_t wait_for_completion(bool is_host_rx)
 {
+    /* Tight spin — matches HEAD's behavior. The yielding variant
+     * (osYieldThread per spin) was hypothesized to fix ISR-delivery
+     * timing but turned out to break actual bus transmission (other
+     * threads ran during the wait, presumably contending for the
+     * shared system bus that USB MMIO uses). HEAD relies on
+     * libultra's preemption: USB MI IRQ delivers mesg to the bridge
+     * thread (priority 250), which preempts main (low priority),
+     * runs vusbh11_isr, sets *flag = 1. We see the flag on next spin
+     * iteration and return.
+     *
+     * If you bring back osYieldThread here, verify bus transmission
+     * still happens (sniffer test for SETUP packets on the wire). */
     volatile uint8_t *flag = is_host_rx ? &s_rx_tokdne_pending : &s_tx_tokdne_pending;
     int spins = 0;
     while (*flag == 0u) {
@@ -493,6 +569,8 @@ static bool do_setup_phase(uint8_t addr_for_log)
 {
     uint32_t setup_phys = dma_phys_base() + BUF_SETUP_OFF;
     uint32_t off = s_tx_next_pong ? BDT_EP0_TX_ODD_OFF : BDT_EP0_TX_EVEN_OFF;
+    uint8_t  pong_at_issue = s_tx_next_pong;
+    uint32_t tokdne_before = vusbh11_telem.tokdne_count;
     /* SETUP packet PID = 0x80 = OWN only (NO DTS). thar0's BDT primer
      * (vusbh11ma.c:_usb_host_vusb11_init_setup_bdt:596) uses bare OWN
      * for SETUP. DTS with no DATA01 was forcing the SIE to expect
@@ -502,6 +580,7 @@ static bool do_setup_phase(uint8_t addr_for_log)
     issue_token(VUSB11_TOKEN_SETUP(0));
 
     uint32_t w0 = wait_for_completion(false);  /* SETUP is host TX */
+    telem_record_token(VUSBH11_TT_SETUP, 1, 0, pong_at_issue, w0, tokdne_before);
     if (w0 == 0u) {
         usb_hal_log("vusbh11: SETUP[addr=%u] timed out\n", addr_for_log);
         return false;
@@ -525,10 +604,13 @@ static uint16_t do_in_data_phase(uint16_t requested)
     uint32_t rx_phys = dma_phys_base() + BUF_RX_OFF;
     for (int attempt = 0; attempt < 50; attempt++) {
         uint32_t off = s_rx_next_pong ? BDT_EP0_RX_ODD_OFF : BDT_EP0_RX_EVEN_OFF;
+        uint8_t  pong_at_issue = s_rx_next_pong;
+        uint32_t tokdne_before = vusbh11_telem.tokdne_count;
         prime_bdt_slot(off, 0xC8, 64, rx_phys);   /* OWN|DTS|DATA1 */
         issue_token(VUSB11_TOKEN_IN(0));
 
         uint32_t w0 = wait_for_completion(true);  /* IN is host RX */
+        telem_record_token(VUSBH11_TT_IN, 0, 0, pong_at_issue, w0, tokdne_before);
         if (w0 == 0u) {
             usb_hal_log("vusbh11: IN attempt %d timed out\n", attempt);
             return 0;
@@ -552,10 +634,13 @@ static bool do_status_out_zlp(void)
 {
     uint32_t setup_phys = dma_phys_base() + BUF_SETUP_OFF;
     uint32_t off = s_tx_next_pong ? BDT_EP0_TX_ODD_OFF : BDT_EP0_TX_EVEN_OFF;
+    uint8_t  pong_at_issue = s_tx_next_pong;
+    uint32_t tokdne_before = vusbh11_telem.tokdne_count;
     prime_bdt_slot(off, 0xC8, 0, setup_phys);   /* OWN|DTS|DATA1, BC=0 */
     issue_token(VUSB11_TOKEN_OUT(0));
 
     uint32_t w0 = wait_for_completion(false);   /* OUT is host TX */
+    telem_record_token(VUSBH11_TT_STATUS_OUT, 1, 0, pong_at_issue, w0, tokdne_before);
     if (w0 == 0u) {
         usb_hal_log("vusbh11: STATUS OUT timed out\n");
         return false;
@@ -574,10 +659,13 @@ static bool do_status_in_zlp(void)
     uint32_t rx_phys = dma_phys_base() + BUF_RX_OFF;
     for (int attempt = 0; attempt < 20; attempt++) {
         uint32_t off = s_rx_next_pong ? BDT_EP0_RX_ODD_OFF : BDT_EP0_RX_EVEN_OFF;
+        uint8_t  pong_at_issue = s_rx_next_pong;
+        uint32_t tokdne_before = vusbh11_telem.tokdne_count;
         prime_bdt_slot(off, 0xC8, 0, rx_phys);   /* OWN|DTS|DATA1, BC=0 */
         issue_token(VUSB11_TOKEN_IN(0));
 
         uint32_t w0 = wait_for_completion(true);
+        telem_record_token(VUSBH11_TT_STATUS_IN, 0, 0, pong_at_issue, w0, tokdne_before);
         if (w0 == 0u) { usb_hal_log("vusbh11: STATUS IN timed out\n"); return false; }
         uint8_t pid = (uint8_t)(((w0 >> 24) >> 2) & 0xFu);
         if (pid == 0xAu) { usb_hal_wait_ms(10); continue; }
@@ -597,6 +685,179 @@ static void read_rx_bytes(uint8_t *dst, uint16_t n)
         uint32_t w = usb_hal_io_read(rx + (i & ~3u));
         dst[i] = (uint8_t)(w >> ((3 - (i & 3)) * 8));
     }
+}
+
+/* Inter-retry recovery. The first SETUP after cold-boot can fail for
+ * two distinct reasons, each needing a different fix:
+ *
+ *   (A) Controller-side transient: TX_SUSPEND_BUSY hasn't cleared,
+ *       ERRSTAT bits still latched, ISR hasn't drained. Fix is just
+ *       wait + clear status bits. SW pong tracker already advanced on
+ *       the TOKDNE (even for BUSTIMEOUT, TOKDNE fires with PID=0), so
+ *       no need to touch it.
+ *
+ *   (B) Device-side wedge: device's USB state machine got stuck mid-
+ *       transaction and won't respond to fresh SETUPs without being
+ *       reset to default. Fix is a real port re-init: SE0 to force
+ *       device to default state, then re-do EVERYTHING attach did
+ *       (speed detect, OTGCTL, EP_CTL, ADDR, BDT zero, pong reset).
+ *
+ * Strategy: assume (A) for the first 2 retries (cheap, fast). If it
+ * still fails, escalate to (B). Heavier than needed for (A) cases but
+ * we only burn this on the rare wedge.
+ *
+ * The previous version of this code did a half-baked (B) — toggled CTL
+ * but never re-wrote EP_CTL/OTGCTL/ADDR after — which left the host
+ * controller in a state where the device's response was ignored. That
+ * regressed an otherwise-working enumeration. This version re-runs the
+ * full init sequence from process_attach so post-reset state is
+ * identical to first-boot state. */
+__attribute__((unused))
+static void retry_recovery_soft(void)
+{
+    /* Drain any in-flight transaction. BTOERR/BUSTIMEOUT itself takes
+     * a few SOF frames to clear TX_SUSPEND_BUSY. */
+    int spins = 0;
+    while (vusb11_read(s_port, VUSB11_OFF_CTL) & VUSB11_CTL_TX_SUSPEND_BUSY) {
+        if (++spins > 100000) break;
+    }
+    /* Gap for device-side retry timeout. */
+    usb_hal_wait_ms(50);
+    /* Clear sticky status. */
+    vusb11_write(s_port, VUSB11_OFF_ISTAT,   0xFFu);
+    vusb11_write(s_port, VUSB11_OFF_ERRSTAT, 0xFFu);
+    vusb11_write(s_port, VUSB11_OFF_REG10,   0xFFu);
+}
+
+/* Full port bring-up sequence: bus reset → controller re-init → ready
+ * to issue the first SETUP (GET_DESCRIPTOR DEVICE 8). Shared by:
+ *   - process_attach (initial cold-boot enumeration)
+ *   - retry_recovery_hard (mid-enum wedge recovery)
+ *
+ * Caller-tunable: post_reset_ms. Cold boot uses 500ms (device may still
+ * be VBUS-powering-up); warm retry uses 250ms (device's already alive,
+ * just need TRSTRCY + pull-up resettle).
+ *
+ * NOT included here, because callers do them differently:
+ *   - SW state reset (s_current_addr, ep toggles): process_attach only
+ *     does this once at the very top; retry path doesn't touch them
+ *     (we're still pre-SET_ADDRESS at this point either way).
+ *   - Telemetry phase markers: caller sets them around the call.
+ *   - SETUP buffer readback diagnostic: process_attach only, one-time.
+ *   - TX_SUSPEND_BUSY drain: process_attach only, defensive no-op. */
+static void port_bringup(uint32_t post_reset_ms)
+{
+    /* DELIBERATELY NOT masking INTEN at top. HEAD (8110c01) didn't do
+     * this and it works. Masking during reset shouldn't matter (no
+     * tokens in flight), but adding it broke the cold-boot enum in
+     * a way we don't fully understand. Match HEAD's order exactly. */
+
+    /* Hold the bus in reset (SE0) for 50ms. USB spec minimum is 10ms
+     * but many cheap drives need closer to 50ms to fully reset internal
+     * state. Keep HOST_MODE_EN set; USB_EN stays off during the reset
+     * hold (per thar0-ultralib's _usb_host_vusb11_reset_the_device). */
+    vusb11_write(s_port, VUSB11_OFF_CTL,
+                 VUSB11_CTL_RESET | VUSB11_CTL_HOST_MODE_EN);
+    usb_hal_wait_ms(50);
+
+    /* Release reset and enable USB_EN in TWO separate writes (matches
+     * thar0's vusbh11ma.c:257-261). Combining them into one write was
+     * causing the controller's SIE to come up with stale BDT pong state
+     * — symptom was BUSTIMEOUT on first SETUP even though speed-detect
+     * showed FULL and the device was physically responsive. */
+    vusb11_write(s_port, VUSB11_OFF_CTL, VUSB11_CTL_HOST_MODE_EN);
+    vusb11_write(s_port, VUSB11_OFF_CTL,
+                 VUSB11_CTL_HOST_MODE_EN | VUSB11_CTL_USB_EN);
+
+
+    /* Caller-tuned post-reset wait. USB spec gives TRSTRCY = 10ms min,
+     * but a freshly-powered device needs longer for D+ pull-up; a
+     * suspended device needs longer to wake. */
+    usb_hal_wait_ms(post_reset_ms);
+
+    /* Speed detect — diagnostic only. Sample JSTATE up to 10 times with
+     * 5ms spacing because the device's pull-up settles non-determini-
+     * stically. USB Mass Storage is FS-only, so we always set ADDR.FSEN
+     * below regardless. Detect kept for telemetry. */
+    uint32_t ctl = 0;
+    for (int try = 0; try < 10; try++) {
+        ctl = vusb11_read(s_port, VUSB11_OFF_CTL);
+        if (ctl & VUSB11_CTL_JSTATE) break;
+        usb_hal_wait_ms(5);
+    }
+    if (ctl & VUSB11_CTL_JSTATE) {
+        vusbh11_device_speed = VUSBH11_SPEED_FULL;
+    } else if (!(ctl & VUSB11_CTL_SE0)) {
+        vusbh11_device_speed = VUSBH11_SPEED_LOW;
+    }
+
+    /* Clear leftover ISTAT/ERRSTAT — RST will have asserted while we
+     * held the reset, and the wrapper REG10 mirrors it. */
+    vusb11_write(s_port, VUSB11_OFF_ISTAT,   0xFFu);
+    vusb11_write(s_port, VUSB11_OFF_ERRSTAT, 0xFFu);
+    vusb11_write(s_port, VUSB11_OFF_REG10,   0xFFu);
+
+    /* === ORDER from HEAD (8110c01) - DO NOT REORDER ===
+     * The original refactor moved EP_CTL/ADDR before BDT/SETUP and put
+     * INTEN enable last. That broke cold-boot enumeration (BUSTIMEOUT
+     * on first SETUP). HEAD's order works; matching it exactly. */
+
+    /* 1. Enable interrupts BEFORE BDT setup, so any reset-related IRQ
+     * that's still being processed has a place to land. USBRSTEN masked
+     * (we drive resets); SOFTOKEN off (1kHz noise). */
+    vusb11_write(s_port, VUSB11_OFF_ERREN, 0xFFu);
+    vusb11_write(s_port, VUSB11_OFF_INTEN,
+                 VUSB11_INTEN_TOKDNEEN |
+                 VUSB11_INTEN_ERROREN);
+
+    /* 2. Zero BDT region (4 EP0 entries). MUST happen BEFORE EP_CTL
+     * enables RX/TX, otherwise the controller could autonomously
+     * consume any stale OWN=1 slot still in MMIO from a prior session. */
+    for (uint32_t off = 0; off < 0x20u; off += 4u) {
+        usb_hal_io_write(bdt_uncached_base() + off, 0u);
+    }
+
+    /* 3. SETUP buffer: GET_DESCRIPTOR(DEVICE, 8).
+     * On-wire bytes 80 06 00 01 00 00 08 00. */
+    uint32_t setup_uncached = dma_uncached_base() + BUF_SETUP_OFF;
+    usb_hal_io_write(setup_uncached + 0, 0x80060001u);
+    usb_hal_io_write(setup_uncached + 4, 0x00000800u);
+
+    /* 4. Clear RX buffer. */
+    uint32_t rx_uncached = dma_uncached_base() + BUF_RX_OFF;
+    usb_hal_io_write(rx_uncached + 0, 0x00000000u);
+    usb_hal_io_write(rx_uncached + 4, 0x00000000u);
+
+    /* 5. EP_CTL[0] = 0x4D = RETRY_DIS | HSHK_EN | RX_EN | TX_EN.
+     * RETRY_DIS required so SIE doesn't auto-retry NAKs internally.
+     * HOST_WO_HUB intentionally NOT set (it's "LS direct attach", not
+     * "no hub" - misleading name). Done AFTER BDT zeroed so enabling
+     * RX/TX doesn't pick up stale OWN=1 entries. */
+    vusb11_write(s_port, VUSB11_OFF_EP_CTL_BASE + 0u * 4u,
+                 VUSB11_EP_RETRY_DIS |
+                 VUSB11_EP_HSHK_EN | VUSB11_EP_RX_EN | VUSB11_EP_TX_EN);
+
+    /* 6. Default address 0, full-speed signaling. */
+    vusb11_write(s_port, VUSB11_OFF_ADDR, VUSB11_ADDR_FSEN | 0u);
+
+    /* 7. HW pong was reset by the bus reset; resync SW. */
+    s_rx_next_pong = 0;
+    s_tx_next_pong = 0;
+    s_rx_tokdne_pending = 0;
+    s_tx_tokdne_pending = 0;
+}
+
+__attribute__((unused))
+static void retry_recovery_hard(void)
+{
+    port_bringup(250);
+}
+
+/* Public hub-level port reset. See vusbh11.h. */
+void vusbh11_port_reset(void)
+{
+    port_bringup(2000);  /* Match cold-boot wait — device may still be in
+                          * post-reset settling, needs full warm-up time. */
 }
 
 /* ----- Bottom-half: process the first attach ----- */
@@ -625,107 +886,25 @@ static void process_attach(void)
     vusbh11_phase = 1;
     usb_hal_log("vusbh11: process_attach -> driving USB reset\n");
 
-    /* Hold the bus in reset (SE0) for 50ms. USB spec minimum is 10ms but
-     * many cheap USB drives need closer to 50ms to fully reset internal
-     * state. Keep HOST_MODE_EN set; USB_EN stays off during the reset
-     * hold (per thar0-ultralib's _usb_host_vusb11_reset_the_device). */
-    vusb11_write(s_port, VUSB11_OFF_CTL,
-                 VUSB11_CTL_RESET | VUSB11_CTL_HOST_MODE_EN);
-    usb_hal_wait_ms(50);
+    /* Bus reset + full controller re-init. Use 2000ms post-reset wait
+     * for cold-boot — empirically the device (USB stick or Pico) needs
+     * more than 500ms to be ready for SETUPs after VBUS cycle, and a
+     * too-short wait causes the first user-facing import-state attempt
+     * to fail (second manual attempt typically works because the device
+     * has had more time to boot). 2 sec is heavy but only matters once
+     * per session at the very first enum. */
+    port_bringup(2000);
 
-    /* Release reset and enable USB_EN in TWO separate writes (matches
-     * thar0's vusbh11ma.c:257-261). Combining them into one write was
-     * causing the controller's SIE to come up with stale BDT pong state
-     * — symptom was BUSTIMEOUT on first SETUP even though speed-detect
-     * showed FULL and the device was physically responsive. */
-    vusb11_write(s_port, VUSB11_OFF_CTL, VUSB11_CTL_HOST_MODE_EN);
-    vusb11_write(s_port, VUSB11_OFF_CTL,
-                 VUSB11_CTL_HOST_MODE_EN | VUSB11_CTL_USB_EN);
-
-    /* USB spec gives the device up to 10 ms to settle after reset (TRSTRCY),
-     * but a freshly-powered device (e.g. after replug, where VBUS dropped
-     * and came back) may need much longer to assert its D+ pull-up.
-     * Wait 250 ms to be generous — only matters on the first attach, not
-     * on the per-transaction critical path. */
-    usb_hal_wait_ms(250);
-
-    /* (Removed post-reset ODD_RST pulse — per K20 TRM, ODD_RST should
-     * only be set with USB_EN=0, and thar0's process_attach does NOT
-     * pulse it here. Doing so with USB_EN=1 was leaving the pong
-     * selector in an intermediate state.) */
-
-    /* Speed detect — diagnostic only. Sample JSTATE up to 10 times with
-     * 5 ms spacing because a freshly-powered device's pull-up settles
-     * non-deterministically (we've seen the first read return LOW =
-     * !JSTATE && !SE0 = K-state, then settle to J a few ms later).
-     *
-     * We DON'T act on the result: USB Mass Storage class is full-speed
-     * only, so we always set ADDR.FSEN below. The detect is kept for
-     * telemetry so we can confirm the bus settled correctly. */
-    uint32_t ctl = 0;
-    for (int try = 0; try < 10; try++) {
-        ctl = vusb11_read(s_port, VUSB11_OFF_CTL);
-        if (ctl & VUSB11_CTL_JSTATE) break;
-        usb_hal_wait_ms(5);
-    }
-    if (ctl & VUSB11_CTL_JSTATE) {
-        vusbh11_device_speed = VUSBH11_SPEED_FULL;
-    } else if (!(ctl & VUSB11_CTL_SE0)) {
-        vusbh11_device_speed = VUSBH11_SPEED_LOW;
-    }
-    /* Whatever the detect says, treat as FS — Mass Storage is FS-only and
-     * we issue tokens with FSEN regardless. The detect mismatch was the
-     * trigger for our BTOERR-on-first-SETUP failure mode. */
     vusbh11_phase = 2;
-
-    /* Clear leftover ISTAT/ERRSTAT — RST will have asserted while we held
-     * the reset, and the wrapper REG10 mirrors it. */
-    vusb11_write(s_port, VUSB11_OFF_ISTAT,   0xFFu);
-    vusb11_write(s_port, VUSB11_OFF_ERRSTAT, 0xFFu);
-    vusb11_write(s_port, VUSB11_OFF_REG10,   0xFFu);
-
-    /* Enable error reporting and the next layer of interrupts.
-     * Deliberately NOT enabling SOFTOKEN yet — at 1kHz it would dominate
-     * the screen output. FRM in the snapshot will tell us SOFs are
-     * happening at the hardware level. */
-    vusb11_write(s_port, VUSB11_OFF_ERREN, 0xFFu);
-    /* USBRSTEN deliberately MASKED in host mode. In host mode we DRIVE
-     * bus resets — we don't need the controller to interrupt us about
-     * them. With USBRSTEN enabled we saw ~35k spurious USBRST IRQs in
-     * 35 seconds (a confused device tail-chases the host into a
-     * SE0/J/K oscillation, each cycle fires USBRST). */
-    vusb11_write(s_port, VUSB11_OFF_INTEN,
-                 VUSB11_INTEN_TOKDNEEN |
-                 VUSB11_INTEN_ERROREN);
-
     usb_hal_log("vusbh11: process_attach done; bus running\n");
     usb_hal_log("vusbh11: BDT at controller MMIO phys 0x%08lx\n",
            (unsigned long)bdt_phys_base());
 
-    /* Zero the BDT region (4 EP0 entries) so unused slots have OWN=0. */
-    for (uint32_t off = 0; off < 0x20u; off += 4u) {
-        usb_hal_io_write(bdt_uncached_base() + off, 0u);
-    }
-
-    /* Write the 8-byte SETUP packet for GET_DESCRIPTOR(DEVICE, 8).
-     *   bmRequestType = 0x80 (IN, Standard, Device)
-     *   bRequest      = 0x06 (GET_DESCRIPTOR)
-     *   wValue        = 0x0100 (DEVICE descriptor, index 0)  [LE on wire]
-     *   wIndex        = 0x0000
-     *   wLength       = 0x0008
-     *
-     * MIPS is big-endian: writing a 32-bit word puts its high byte at the
-     * lowest address. The on-wire byte stream for the SETUP packet is
-     * 80 06 00 01 00 00 08 00 (wValue and wLength are little-endian on
-     * the wire), so we pack accordingly. */
-    uint32_t setup_uncached = dma_uncached_base() + BUF_SETUP_OFF;
-    usb_hal_io_write(setup_uncached + 0, 0x80060001u);  /* bytes: 80 06 00 01 */
-    usb_hal_io_write(setup_uncached + 4, 0x00000800u);  /* bytes: 00 00 08 00 */
-
-    /* Verify what's actually in the buffer (no swap, no parsing — pure
-     * byte read-back). If these don't match 80 06 00 01 00 00 08 00,
-     * our writes are getting mangled and the device gets garbage. */
+    /* Verify SETUP buffer survived the write (diagnostic only — runs
+     * once on first attach). If these don't match 80 06 00 01 00 00 08 00,
+     * our io_write is getting mangled and the device gets garbage. */
     {
+        uint32_t setup_uncached = dma_uncached_base() + BUF_SETUP_OFF;
         uint32_t w0 = usb_hal_io_read(setup_uncached + 0);
         uint32_t w1 = usb_hal_io_read(setup_uncached + 4);
         uint8_t  b[8] = {
@@ -738,30 +917,6 @@ static void process_attach(void)
                b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]);
         usb_hal_log("vusbh11:   (expected:        80 06 00 01 00 00 08 00)\n");
     }
-
-    /* Clear RX buffer so we can see what came back. */
-    uint32_t rx_uncached = dma_uncached_base() + BUF_RX_OFF;
-    usb_hal_io_write(rx_uncached + 0, 0x00000000u);
-    usb_hal_io_write(rx_uncached + 4, 0x00000000u);
-
-    /* Configure EP0 control = RETRY_DIS | HSHK_EN | RX_EN | TX_EN = 0x4D.
-     *
-     * RETRY_DIS is required: without it the SIE silently auto-retries
-     * NAKs internally and only surfaces BTOERR after its own budget.
-     *
-     * HOST_WO_HUB (bit 7) is INTENTIONALLY NOT SET here. The bit name is
-     * misleading: per usb_hw.h in thar0-ultralib, it means "directly
-     * connected LOW-speed device, no hub between us" — setting it on a
-     * full-speed device causes the SIE to use LS timing/PRE prefixes and
-     * the device never sees a valid FS token. Symptom: BUSTIMEOUT on
-     * every SETUP. Set it ONLY for LS direct-attach (we don't bother
-     * since USB Mass Storage is FS-only). */
-    vusb11_write(s_port, VUSB11_OFF_EP_CTL_BASE + 0u * 4u,
-                 VUSB11_EP_RETRY_DIS |
-                 VUSB11_EP_HSHK_EN | VUSB11_EP_RX_EN | VUSB11_EP_TX_EN);
-
-    /* Device is still on default address 0; FSEN = full-speed signaling. */
-    vusb11_write(s_port, VUSB11_OFF_ADDR, VUSB11_ADDR_FSEN | 0u);
 
     /* Wait for any in-flight token to finish. Should be a no-op right
      * now — we haven't issued anything yet. */
@@ -789,17 +944,69 @@ static void process_attach(void)
      * ~10 ms elapses. The helpers run back-to-back, well within that. */
 
     usb_hal_log("vusbh11: SETUP+IN+STATUS via helpers (GET_DESCRIPTOR DEVICE 8)\n");
-    /* Retry the first SETUP. Some drives need multiple attempts after
-     * power-up before they consistently respond — we've observed
-     * intermittent BTOERR on first SETUP that goes away on retry.
-     * Capture the BDT writeback w0 for each attempt so post-mortem can
-     * see the actual PID (0x0=BUSTIMEOUT, 0x2=ACK, 0xA=NAK, 0xE=STALL). */
+    /* Clear per-retry diagnostic log. */
+    for (int i = 0; i < 5; i++) {
+        for (int j = 0; j < 4; j++) vusbh11_telem.setup_retry_log[i][j] = 0;
+    }
+    /* SETUP retry loop. The first SETUP after cold-boot is the most
+     * fragile transaction in the whole driver — the drive's USB MCU
+     * may not be fully booted, the controller PHY may need warm-up,
+     * etc. Retry up to 10 times. Between each failed attempt, drive
+     * a full bus reset cycle (matching what process_attach did at
+     * start) — this consistently wakes flaky drives and re-syncs
+     * controller state. Only the first 5 retries are recorded in
+     * setup_retry_log (still useful for diagnosis). */
     bool setup_ok = false;
-    for (int retry = 0; retry < 5; retry++) {
+    for (int retry = 0; retry < 10; retry++) {
+        /* Snapshot CTL right before we issue the SETUP token. */
+        uint8_t ctl_pre = (uint8_t)(vusb11_read(s_port, VUSB11_OFF_CTL) & 0xFFu);
+
+        /* Snapshot tokdne_count BEFORE the attempt — we'll use it to
+         * tell apart "TOKDNE fired with PID=0 (BUSTIMEOUT)" from
+         * "wait_for_completion truly timed out, no TOKDNE". */
+        uint32_t tokdne_before = vusbh11_tokdne_count;
+
         setup_ok = do_setup_phase(0);
         vusbh11_last_setup_w0 = s_tx_last_w0;
+
+        uint8_t pid_post;
+        if (vusbh11_tokdne_count != tokdne_before) {
+            /* TOKDNE did fire. Extract PID from byte 0 bits 5:2 of the
+             * BDT writeback. 0 = BUSTIMEOUT, 2 = ACK, A = NAK, E = STALL. */
+            pid_post = (uint8_t)(((s_tx_last_w0 >> 24) >> 2) & 0xFu);
+        } else {
+            /* No TOKDNE; controller never reported completion. */
+            pid_post = 0xFE;
+        }
+        uint8_t errstat_post = (uint8_t)(vusbh11_last_errstat & 0xFFu);
+        uint8_t success      = setup_ok ? 1 : 0;
+
+        if (retry < 5) {
+            vusbh11_telem.setup_retry_log[retry][0] = ctl_pre;
+            vusbh11_telem.setup_retry_log[retry][1] = errstat_post;
+            vusbh11_telem.setup_retry_log[retry][2] = pid_post;
+            vusbh11_telem.setup_retry_log[retry][3] = success;
+        }
+
         if (setup_ok) break;
         vusbh11_first_setup_retries++;
+
+        /* Inter-retry delay: just sleep. Do NOT call port_bringup or
+         * any other reset between retries — that drops USB_EN which
+         * power-cycles the device on iQue (VBUS-gated by USB_EN).
+         * Verified on hardware via Pico USB-side instrumentation:
+         * with port_bringup between retries, the Pico saw VBUS cycle
+         * every ~540ms and the iQue generated zero SOFs during the
+         * "up" windows → SETUPs went out into a non-maintained bus →
+         * no device response → BUSTIMEOUT.
+         *
+         * Real Linux drivers reserve port reset for the HUB layer
+         * (hub_port_reset), only invoked when a device looks genuinely
+         * dead (failed enumeration repeated, hub disconnect, etc.).
+         * For URB-level transmit retries, just back off and try again.
+         *
+         * retry_recovery_soft / retry_recovery_hard remain defined for
+         * a future hub-level recovery path in iquesync_disk_init. */
         usb_hal_wait_ms(50);
     }
     if (!setup_ok) {
@@ -1555,7 +1762,10 @@ static uint8_t send_bot_out_cmd(const uint8_t *cdb, uint8_t cdb_len,
 }
 
 /* Build + send a SCSI INQUIRY through Bulk-Only Transport. Returns true
- * on full success (CBW ACKed + INQUIRY data received + CSW status=passed). */
+ * on full success (CBW ACKed + INQUIRY data received + CSW status=passed).
+ * Kept for reference / debug builds; the live path uses send_bot_in_cmd
+ * with the INQUIRY CDB instead, for unified BOT semantics. */
+__attribute__((unused))
 static bool send_inquiry(void)
 {
     /* Build CBW (31 bytes, wire byte order). */
@@ -1738,6 +1948,10 @@ void vusbh11_isr(void)
             s_rx_next_pong ^= 1u;
             s_rx_tokdne_pending = 1;
         }
+        /* Snapshot SW pong post-advance so the memory viewer can compare
+         * against last_tokdne_stat bit 2 (HW ODD bit) to detect drift. */
+        vusbh11_telem.sw_rx_next_pong = s_rx_next_pong;
+        vusbh11_telem.sw_tx_next_pong = s_tx_next_pong;
     }
     if (istat & VUSB11_ISTAT_SOFTOK)     vusbh11_softok_count++;
     if (istat & VUSB11_ISTAT_ERROR)      vusbh11_error_count++;
@@ -1832,7 +2046,8 @@ static int do_read_chunk(uint32_t lba, uint16_t n_blocks, uint8_t *dst)
     uint8_t status = send_bot_in_cmd(cdb, 10, BUF_BULK_IN_OFF, want, &got);
     if (status != 0 || got != want)
         return -1;
-    copy_from_bulk(dst, BUF_BULK_IN_OFF, want);
+    if (dst != NULL)
+        copy_from_bulk(dst, BUF_BULK_IN_OFF, want);
     return 0;
 }
 
@@ -1859,12 +2074,16 @@ static int do_write_chunk(uint32_t lba, uint16_t n_blocks, const uint8_t *src)
     return 0;
 }
 
-int vusbh11_disk_read(uint32_t lba, uint32_t n_blocks, void *dst)
+static int vusbh11_disk_read_inner(uint32_t lba, uint32_t n_blocks, void *dst)
 {
     if (vusbh11_block_size != 512 || vusbh11_block_count == 0)
         return -1;
     if (lba + n_blocks > vusbh11_block_count)
         return -1;
+    /* Mirror disk_write's NULL handling: a NULL dst means "perform the
+     * SCSI read but discard the bytes" (we still need to drain the bulk
+     * IN data phase for the CSW to come back). Whether fat.c actually
+     * does this for FAT_READ is unclear — be defensive. */
     uint8_t *p = (uint8_t *)dst;
     while (n_blocks > 0) {
         uint16_t chunk = (n_blocks > VUSBH11_MAX_CHUNK_BLOCKS)
@@ -1874,12 +2093,19 @@ int vusbh11_disk_read(uint32_t lba, uint32_t n_blocks, void *dst)
             return -1;
         lba      += chunk;
         n_blocks -= chunk;
-        p        += (uint32_t)chunk * 512u;
+        if (p != NULL)
+            p += (uint32_t)chunk * 512u;
     }
     return 0;
 }
 
-int vusbh11_disk_write(uint32_t lba, uint32_t n_blocks, const void *src)
+/* Static zero buffer for the "write N zero blocks" case (NULL src) —
+ * gz's fat.c uses NULL as shorthand for "extend file with zeros".
+ * Allocating in BSS so it costs no ROM space. Sized to the same max
+ * chunk as do_write_chunk uses. */
+static const uint8_t s_zero_chunk[VUSBH11_MAX_CHUNK_BLOCKS * 512u];
+
+static int vusbh11_disk_write_inner(uint32_t lba, uint32_t n_blocks, const void *src)
 {
     if (vusbh11_block_size != 512 || vusbh11_block_count == 0)
         return -1;
@@ -1890,13 +2116,130 @@ int vusbh11_disk_write(uint32_t lba, uint32_t n_blocks, const void *src)
         uint16_t chunk = (n_blocks > VUSBH11_MAX_CHUNK_BLOCKS)
                        ? (uint16_t)VUSBH11_MAX_CHUNK_BLOCKS
                        : (uint16_t)n_blocks;
-        if (do_write_chunk(lba, chunk, p) != 0)
+        /* Substitute the zero buffer if caller passed NULL (gz's
+         * "fill with zeros" convention). do_write_chunk is unchanged
+         * and always sees a valid pointer. */
+        const uint8_t *chunk_src = (p != NULL) ? p : s_zero_chunk;
+        if (do_write_chunk(lba, chunk, chunk_src) != 0)
             return -1;
         lba      += chunk;
         n_blocks -= chunk;
-        p        += (uint32_t)chunk * 512u;
+        if (p != NULL)
+            p += (uint32_t)chunk * 512u;
     }
     return 0;
+}
+
+/* ===== BOMSR (Bulk-Only Mass Storage Reset) recovery =====
+ *
+ * USB Mass Storage class spec mandates this recovery sequence when the
+ * BOT (Bulk-Only Transport) state machine gets out of sync — e.g. after
+ * a mid-transfer cancel by the host application, after a STALL, after
+ * any unexpected bulk error. Without it, the bulk EP toggles between
+ * host and device drift apart and every subsequent transfer fails.
+ *
+ * Standard recovery:
+ *   1. Mass Storage Reset (class request 0xFF to interface) — device
+ *      resets its BOT state machine and prepares to receive a fresh CBW.
+ *   2. CLEAR_FEATURE(ENDPOINT_HALT) on bulk-IN  endpoint — device's
+ *      DATA toggle for EP1 IN resets to DATA0.
+ *   3. CLEAR_FEATURE(ENDPOINT_HALT) on bulk-OUT endpoint — device's
+ *      DATA toggle for EP2 OUT resets to DATA0.
+ *   4. We reset our SW toggle trackers to DATA0 to match.
+ *
+ * After this, the device should accept a fresh CBW. We retry the
+ * failed SCSI command once. */
+
+static bool bomsr_send_setup_no_data(const uint8_t setup_bytes[8])
+{
+    write_setup_packet(setup_bytes);
+    vusb11_write(s_port, VUSB11_OFF_ADDR, VUSB11_ADDR_FSEN | s_current_addr);
+    if (!do_setup_phase(s_current_addr))
+        return false;
+    if (!do_status_in_zlp())
+        return false;
+    return true;
+}
+
+static bool bot_reset(void)
+{
+    vusbh11_bomsr_attempts++;
+
+    /* 1. Mass Storage Reset
+     *    bmRequestType=0x21 (OUT, Class, Interface)
+     *    bRequest=0xFF (BOMSR)
+     *    wValue=0, wIndex=0 (interface 0), wLength=0 */
+    static const uint8_t msr_setup[8] = {
+        0x21, 0xFF, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    };
+    if (!bomsr_send_setup_no_data(msr_setup))
+        return false;
+    /* Spec recommends ≥5 ms before next request; give 50 to be safe. */
+    usb_hal_wait_ms(50);
+
+    /* 2. CLEAR_FEATURE(ENDPOINT_HALT) on EP1 IN (0x81)
+     *    bmRequestType=0x02 (OUT, Standard, Endpoint)
+     *    bRequest=0x01 (CLEAR_FEATURE)
+     *    wValue=0x00 (ENDPOINT_HALT)
+     *    wIndex=0x81 (EP1 IN) */
+    static const uint8_t cf_ep1in[8] = {
+        0x02, 0x01, 0x00, 0x00, 0x81, 0x00, 0x00, 0x00,
+    };
+    if (!bomsr_send_setup_no_data(cf_ep1in))
+        return false;
+
+    /* 3. CLEAR_FEATURE(ENDPOINT_HALT) on EP2 OUT (0x02) */
+    static const uint8_t cf_ep2out[8] = {
+        0x02, 0x01, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00,
+    };
+    if (!bomsr_send_setup_no_data(cf_ep2out))
+        return false;
+
+    /* 4. Reset SW toggle trackers — device's bulk EP toggles are DATA0
+     *    now (CLEAR_FEATURE behavior). */
+    s_ep_in_toggle[1]  = 0;
+    s_ep_out_toggle[2] = 0;
+
+    vusbh11_bomsr_successes++;
+    return true;
+}
+
+/* Public wrappers: try the operation, and on failure attempt BOMSR
+ * recovery + retry once. If even BOMSR + retry fails, the device is
+ * considered "lost" — invalidate the geometry cache so the next
+ * iquesync_disk_init call will miss the cache and trigger a full
+ * re-enumeration (including hub-level port_reset escalation).
+ *
+ * Without this invalidation, after a transient device failure (e.g.
+ * gz's sys_reset leaving the device in a confused mid-CSW state),
+ * the cache would keep returning "device ready" but all reads/writes
+ * would fail forever — user sees "no disk" on every subsequent
+ * import-state attempt until a power cycle. */
+
+static void invalidate_geometry_cache(void)
+{
+    vusbh11_telem.block_size  = 0;
+    vusbh11_telem.block_count = 0;
+}
+
+int vusbh11_disk_read(uint32_t lba, uint32_t n_blocks, void *dst)
+{
+    int rc = vusbh11_disk_read_inner(lba, n_blocks, dst);
+    if (rc == 0) return 0;
+    if (!bot_reset()) { invalidate_geometry_cache(); return -1; }
+    rc = vusbh11_disk_read_inner(lba, n_blocks, dst);
+    if (rc != 0) invalidate_geometry_cache();
+    return rc;
+}
+
+int vusbh11_disk_write(uint32_t lba, uint32_t n_blocks, const void *src)
+{
+    int rc = vusbh11_disk_write_inner(lba, n_blocks, src);
+    if (rc == 0) return 0;
+    if (!bot_reset()) { invalidate_geometry_cache(); return -1; }
+    rc = vusbh11_disk_write_inner(lba, n_blocks, src);
+    if (rc != 0) invalidate_geometry_cache();
+    return rc;
 }
 
 #endif /* Z64_VERSION == Z64_OOTIQC */
