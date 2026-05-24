@@ -899,15 +899,16 @@ static void process_attach(void)
     vusbh11_phase = 1;
     usb_hal_log("vusbh11: process_attach -> driving USB reset\n");
 
-    /* Bus reset + full controller re-init. Thar0-style timings:
-     *   pre_reset_settle_ms = 500: longer than thar0's 50ms because we
-     *     may be called from cold boot where the device has only just
-     *     received VBUS and needs to fully power up before its D+ pull-up
-     *     is stable
-     *   reset_hold_ms = 10: matches thar0 (TRSTRCY min)
-     *   post_reset_ms = 50: a bit more than thar0's 10ms to be safe
-     * Total cold-boot delay: ~560ms (vs previous 2050ms) */
-    port_bringup(500, 10, 50);
+    /* Bus reset + full controller re-init. Bumped pre_reset_settle to
+     * 2000ms — confirmed via sniffer that cold-boot import-state
+     * failures correlate with the device not responding to SETUPs
+     * (BUSTIMEOUT for all 10 retries). Real USB flash drives take 1-2
+     * sec after VBUS rise for their internal USB MCU to fully boot.
+     * 500ms wasn't enough; 2 sec gives margin.
+     *   pre_reset_settle_ms = 2000: device warmup time
+     *   reset_hold_ms = 10: matches thar0/TRSTRCY min
+     *   post_reset_ms = 50: device stability after reset release */
+    port_bringup(2000, 10, 50);
 
     vusbh11_phase = 2;
     usb_hal_log("vusbh11: process_attach done; bus running\n");

@@ -65,21 +65,48 @@ static int iquesync_disk_init(void)
     if (vusbh11_init(IQUESYNC_HOST_PORT) != VUSB11_OK)
         return -1;
 
-    /* Inlined polling loop matching HEAD byte-for-byte. (Was a helper
-     * try_enumerate(); inlined to rule out any compiler/codegen
-     * differences vs HEAD.) Force fresh re-enumeration on every
-     * disk_init by clearing geometry and setting attach_pending. */
-    vusbh11_telem.block_size  = 0;
-    vusbh11_telem.block_count = 0;
-    vusbh11_telem.attach_pending = true;
+    /* Defensive: re-bind USB IRQ → bridge thread queue + re-arm MI mask.
+     * After any other gz code that called osSetEventMesg or touched
+     * MI_BB_MASK (rdb.c registers fault/break events; menus may
+     * disable interrupts during draw), our USB ISR delivery can be
+     * broken — telemetry shows isr_count=0, all SETUPs PID=0xFE,
+     * controller stuck with TX_SUSPEND_BUSY. usb_hal_irq_rearm()
+     * re-registers our queue with libultra's event dispatch table
+     * and re-enables MI without recreating the bridge thread. */
+    usb_hal_irq_rearm(IQUESYNC_HOST_PORT);
 
-    uint32_t waited = 0;
-    while (waited < IQUESYNC_ATTACH_TIMEOUT_MS) {
-        vusbh11_poll();
-        if (vusbh11_telem.block_size == 512 && vusbh11_telem.block_count > 0)
-            return 0;
-        usb_hal_wait_ms(50);
-        waited += 50;
+    /* Multi-attempt enumeration. Sniffer confirmed (via D+ activity
+     * patterns showing massive bus-reset hammering + telemetry's
+     * BUSTIMEOUT history on all SETUP retries) that cold-boot first
+     * try often fails because the USB drive's internal USB MCU isn't
+     * fully booted yet. Real flash drives need 1-2 sec after VBUS
+     * rise before they can respond to SETUPs.
+     *
+     * Each attempt's process_attach has 2000ms pre_reset_settle, so
+     * total cold-boot worst case is ENUM_TRIES × (~5sec) = ~15 sec
+     * before "no disk" displays. Brief 500ms pause between attempts
+     * gives the device extra time to recover from any partial state. */
+    enum { ENUM_TRIES = 3 };
+    for (int try = 0; try < ENUM_TRIES; try++) {
+        if (try > 0) {
+            usb_hal_log("iquesync_disk_init: retry attempt %d/%d\n",
+                        try + 1, ENUM_TRIES);
+            usb_hal_wait_ms(500);
+        }
+
+        vusbh11_telem.block_size  = 0;
+        vusbh11_telem.block_count = 0;
+        vusbh11_telem.attach_pending = true;
+
+        uint32_t waited = 0;
+        while (waited < IQUESYNC_ATTACH_TIMEOUT_MS) {
+            vusbh11_poll();
+            if (vusbh11_telem.block_size == 512 && vusbh11_telem.block_count > 0)
+                return 0;
+            usb_hal_wait_ms(50);
+            waited += 50;
+        }
+        /* Timed out — loop to next try if available. */
     }
     return -1;
 }

@@ -175,6 +175,14 @@ void usb_hal_irq_remove(int port);
  * at startup, and (for cleanup) enable(false) + remove. */
 void usb_hal_irq_enable(int port, bool on);
 
+/* Re-arm interrupt delivery WITHOUT recreating the bridge thread or
+ * message queue. Calls back into the OS event-mesg layer to re-bind
+ * the USB IRQ event to our existing queue, in case another piece of
+ * code in the host environment overwrote the binding. Idempotent and
+ * safe to call from anywhere. Used by iquesync_disk_init to defend
+ * against gz state clearing between sessions. */
+void usb_hal_irq_rearm(int port);
+
 /* printf-style diagnostic log. Environments without a log channel may
  * stub this to no-op. */
 void usb_hal_log(const char *fmt, ...) __attribute__((format(printf, 1, 2)));

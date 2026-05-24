@@ -149,6 +149,22 @@ void usb_hal_irq_enable(int port, bool on)
     }
 }
 
+void usb_hal_irq_rearm(int port)
+{
+    /* Re-register OS event → message queue binding. libultra's
+     * __osEventStateTab is a flat array indexed by event number;
+     * any caller that does osSetEventMesg with the same event ID
+     * overwrites our binding silently. Re-calling here ensures
+     * USB IRQs deliver to OUR queue regardless of what else
+     * happened in between. Doesn't touch the thread or queue,
+     * so no state corruption. */
+    int p = port & 1;
+    OSEvent ev = (p == 0) ? USB_HAL_OS_EVENT_USB0 : USB_HAL_OS_EVENT_USB1;
+    osSetEventMesg(ev, &s_isr_mq[p], (OSMesg)(uintptr_t)p);
+    /* Re-arm MI as well, in case it was masked. */
+    usb_hal_irq_enable(port, true);
+}
+
 void usb_hal_log(const char *fmt, ...)
 {
     /* Route to libultra's osSyncPrintf, which on iQue SK firmware
