@@ -445,33 +445,47 @@ static void host_mode(vusb11_port_t port)
 
 vusb11_status_t vusbh11_init(vusb11_port_t port)
 {
-    /* Idempotent: gz's iquesync_disk_init calls this on every "import
-     * state" / "reset disk" / etc. The first call creates the ISR
-     * bridge thread (usb_hal_irq_install → osCreateThread). A second
-     * call would osCreateThread *into the same OSThread struct* while
-     * the existing thread is blocked on osRecvMesg — corrupting
-     * libultra's __osActiveQueue linkage and crashing later (observed
-     * as a TLB store fault in load_state, kuseg VA, USB CTL register
-     * still parked in T1). Skip re-init if already up. */
-    if (s_initted)
-        return VUSB11_OK;
-
+    /* Split idempotency: ISR-bridge threads are created exactly once
+     * (re-osCreateThread'ing the same OSThread while it's blocked on
+     * osRecvMesg corrupts libultra's __osActiveQueue and shows up later
+     * as a TLB store fault in load_state). But the *controller* state
+     * MUST be re-brought-up every call — otherwise:
+     *   - vusbh11_isr masks INTEN.ATTACHEN after the first attach (ATTACH
+     *     is level-asserted while the device is present, so the bit re-
+     *     fires immediately on every W1C; masking the enable bit is the
+     *     only way to silence the storm). With the device still plugged
+     *     in across sessions, no fresh ATTACH event ever reaches the
+     *     ISR → process_attach never runs → no port_bringup.
+     *   - TX_SUSPEND_BUSY (CTL bit 5) can stick high after a previous
+     *     transaction; only a USB_EN off→on toggle (inside port_bringup)
+     *     clears it in hardware.
+     *   - BDT EVEN/ODD bank tracker desyncs from SW; CTL.ODD_RST in
+     *     ctlr_init resets HW pong, and port_bringup resets the SW
+     *     trackers to match.
+     * The first call did all of these correctly; subsequent calls used
+     * to skip everything, which is why "reset disk" fell over with CTL=
+     * 0xA9 + ISTAT=0x44 + BDT TX EVEN OWN=1 stuck unconsumed. */
     s_port = port;
 
-    /* Register handlers BEFORE making the controller capable of firing
-     * interrupts — libdragon's MI dispatcher asserts if a USB IRQ fires
-     * with no handler. We register on BOTH ports defensively; only the
-     * one we initialize will actually fire ATTACH/etc. */
-    trace("entered vusbh11_init");
-    trace("register BB_USB0 + BB_USB1 handlers");
-    usb_hal_irq_install(0, vusbh11_isr);
-    usb_hal_irq_install(1, vusbh11_isr);
+    if (!s_initted) {
+        /* One-shot: ISR bridge threads + handlers on BOTH ports
+         * (libdragon's MI dispatcher asserts if a USB IRQ fires with no
+         * handler). */
+        trace("entered vusbh11_init (first call — installing handlers)");
+        usb_hal_irq_install(0, vusbh11_isr);
+        usb_hal_irq_install(1, vusbh11_isr);
+        s_initted = true;
+    } else {
+        trace("entered vusbh11_init (re-bringup — threads already alive)");
+    }
 
+    /* Every call: re-quiesce + re-bring-up the controller. Pure MMIO,
+     * safe with the bridge thread parked on osRecvMesg. */
     trace("ctlr_init(host port)");
     ctlr_init(port);
 
-    /* The other port still needs to be brought into SOME consistent state
-     * so its wrapper doesn't drive spurious signals — quiesce it. */
+    /* Quiesce the other port too so its wrapper doesn't drive spurious
+     * signals. */
     {
         vusb11_port_t other = (port == VUSB11_PORT_USB0) ? VUSB11_PORT_USB1
                                                          : VUSB11_PORT_USB0;
@@ -486,7 +500,6 @@ vusb11_status_t vusbh11_init(vusb11_port_t port)
     usb_hal_irq_enable(0, true);
     usb_hal_irq_enable(1, true);
 
-    s_initted = true;
     trace("vusbh11_init done — waiting for ATTACH");
     return VUSB11_OK;
 }
@@ -712,15 +725,31 @@ static void read_rx_bytes(uint8_t *dst, uint16_t n)
  * regressed an otherwise-working enumeration. This version re-runs the
  * full init sequence from process_attach so post-reset state is
  * identical to first-boot state. */
-__attribute__((unused))
 static void retry_recovery_soft(void)
 {
-    /* Drain any in-flight transaction. BTOERR/BUSTIMEOUT itself takes
-     * a few SOF frames to clear TX_SUSPEND_BUSY. */
+    /* Drain any in-flight transaction naturally first. BTOERR/
+     * BUSTIMEOUT normally takes a few SOF frames to clear TX_SUSPEND_BUSY. */
     int spins = 0;
     while (vusb11_read(s_port, VUSB11_OFF_CTL) & VUSB11_CTL_TX_SUSPEND_BUSY) {
         if (++spins > 100000) break;
     }
+
+    /* If natural drain didn't work, FORCE-clear TX_SUSPEND_BUSY via RMW.
+     * Per thar0's vusbd11ma.c:199 (device-mode SETUP recovery), this bit
+     * IS software-clearable on the K20-derived SIE:
+     *   usb_dev_ptr->USB->CONTROL &= ~USB_CTL_TX_SUSPEND_TOKEN_BUSY;
+     * Even though port_bringup's CTL writes have bit 5 = 0, the controller
+     * seems to ignore that on iQue's variant — we need an explicit RMW
+     * that reads the current CTL value and writes it back with bit 5
+     * masked off. This unwedges the SIE when a previous SETUP got no
+     * response and BUSTIMEOUT didn't fire. */
+    uint32_t ctl = vusb11_read(s_port, VUSB11_OFF_CTL);
+    if (ctl & VUSB11_CTL_TX_SUSPEND_BUSY) {
+        vusb11_write(s_port, VUSB11_OFF_CTL, ctl & ~VUSB11_CTL_TX_SUSPEND_BUSY);
+        usb_hal_log("vusbh11: retry_recovery_soft: force-cleared TX_SUSPEND_BUSY (was 0x%02x)\n",
+                    (unsigned)ctl);
+    }
+
     /* Gap for device-side retry timeout. */
     usb_hal_wait_ms(50);
     /* Clear sticky status. */
@@ -790,11 +819,20 @@ static void port_bringup(uint32_t pre_reset_settle_ms,
     /* === Step 4: ADDR = FSEN | 0 (device default address) === */
     vusb11_write(s_port, VUSB11_OFF_ADDR, VUSB11_ADDR_FSEN | 0u);
 
-    /* === Step 5: EP_CTL[0] = RETRY_DIS | HSHK_EN | RX_EN | TX_EN ===
+    /* === Step 5: EP_CTL[0] = HSHK_EN | RX_EN | TX_EN ===
      * Configure endpoint BEFORE reset so when device comes out of reset
-     * it sees a fully-configured host. */
+     * it sees a fully-configured host.
+     *
+     * RETRY_DIS DELIBERATELY CLEARED. Theory: on the iQue's K20-derived
+     * SIE, RETRY_DIS may prevent the BUSTIMEOUT timer from firing when
+     * the device doesn't respond — symptom is TX_SUSPEND_BUSY stuck SET
+     * forever after a SETUP that gets no response, wedging all
+     * subsequent retries. Cold boot works because the device DOES
+     * respond, so we never hit BUSTIMEOUT path. After reset-disk the
+     * device is in a confused state and doesn't respond → wedge.
+     * Without RETRY_DIS the SIE will auto-retry NAKs internally (which
+     * we don't see for SETUP anyway) AND honor BUSTIMEOUT properly. */
     vusb11_write(s_port, VUSB11_OFF_EP_CTL_BASE + 0u * 4u,
-                 VUSB11_EP_RETRY_DIS |
                  VUSB11_EP_HSHK_EN | VUSB11_EP_RX_EN | VUSB11_EP_TX_EN);
 
     /* === Step 6-7: bus reset (SE0 hold) ===
@@ -1006,23 +1044,28 @@ static void process_attach(void)
         if (setup_ok) break;
         vusbh11_first_setup_retries++;
 
-        /* Inter-retry delay: just sleep. Do NOT call port_bringup or
-         * any other reset between retries — that drops USB_EN which
-         * power-cycles the device on iQue (VBUS-gated by USB_EN).
-         * Verified on hardware via Pico USB-side instrumentation:
-         * with port_bringup between retries, the Pico saw VBUS cycle
-         * every ~540ms and the iQue generated zero SOFs during the
-         * "up" windows → SETUPs went out into a non-maintained bus →
-         * no device response → BUSTIMEOUT.
+        /* Inter-retry recovery. After a failed SETUP, the controller's
+         * SIE often gets stuck with CTL.TX_SUSPEND_BUSY (bit 5) HIGH —
+         * confirmed via memory viewer after a reset-disk-then-import
+         * failure: CTL=0xA9 for retries 1-4 (the BUSY bit set). While
+         * BUSY is set, the controller silently ignores new TOKEN writes,
+         * so subsequent retries are pointless without first clearing
+         * BUSY.
          *
-         * Real Linux drivers reserve port reset for the HUB layer
-         * (hub_port_reset), only invoked when a device looks genuinely
-         * dead (failed enumeration repeated, hub disconnect, etc.).
-         * For URB-level transmit retries, just back off and try again.
+         * retry_recovery_soft() spins waiting for TX_SUSPEND_BUSY to
+         * clear (up to 100k spins ≈ 1ms), then waits 50ms, then clears
+         * sticky status bits. This is the SAFE recovery — does NOT
+         * touch USB_EN (would power-cycle the device on iQue) and does
+         * NOT drive bus reset (which forces device to default address
+         * mid-enum). Just gives the controller a moment to settle and
+         * clears state.
          *
-         * retry_recovery_soft / retry_recovery_hard remain defined for
-         * a future hub-level recovery path in iquesync_disk_init. */
-        usb_hal_wait_ms(50);
+         * Was originally added in the BOMSR refactor, then mistakenly
+         * removed when we attributed cold-boot failures to it. Actual
+         * cold-boot bug was device-warmup timing (fixed via longer
+         * pre_reset_settle_ms). This recovery is needed for the
+         * separate reset-disk failure mode. */
+        retry_recovery_soft();
     }
     if (!setup_ok) {
         usb_hal_log("vusbh11: first SETUP failed after retries\n");
@@ -1396,10 +1439,12 @@ static void issue_token(uint8_t token_byte)
         usb_hal_log("vusbh11: TX_SUSPEND_BUSY stuck before TOKEN=%02x\n", token_byte);
         return;
     }
-    /* EP0 control = 0x4D (no HOST_WO_HUB — that bit is for LOW-speed
-     * direct attach; setting it on FS causes BUSTIMEOUT). */
+    /* EP0 control = 0x0D (HSHK_EN | RX_EN | TX_EN, NO RETRY_DIS).
+     * RETRY_DIS was theorized to prevent BUSTIMEOUT firing → SIE wedge
+     * when device doesn't respond (e.g. after reset-disk leaves device
+     * in confused state). Cleared throughout to keep behavior consistent
+     * with port_bringup. */
     vusb11_write(s_port, VUSB11_OFF_EP_CTL_BASE + 0u,
-                 VUSB11_EP_RETRY_DIS |
                  VUSB11_EP_HSHK_EN | VUSB11_EP_RX_EN | VUSB11_EP_TX_EN);
     /* Always re-write ADDRESS per Thar0's send_token pattern. The bit 7
      * (LSEN) stays 0 for full-speed; bits 6:0 carry the device address. */
