@@ -729,118 +729,126 @@ static void retry_recovery_soft(void)
     vusb11_write(s_port, VUSB11_OFF_REG10,   0xFFu);
 }
 
-/* Full port bring-up sequence: bus reset → controller re-init → ready
- * to issue the first SETUP (GET_DESCRIPTOR DEVICE 8). Shared by:
- *   - process_attach (initial cold-boot enumeration)
- *   - retry_recovery_hard (mid-enum wedge recovery)
+/* Full port bring-up sequence — REWRITTEN to match thar0's
+ * _usb_host_vusb11_process_attach order (vusbh11ma.c:264-305).
  *
- * Caller-tunable: post_reset_ms. Cold boot uses 500ms (device may still
- * be VBUS-powering-up); warm retry uses 250ms (device's already alive,
- * just need TRSTRCY + pull-up resettle).
+ * Thar0's order (proven working on libultra):
+ *   1. Enable error reporting (ERREN = ALL)
+ *   2. Wait pre_reset_settle_ms for D+ pull-up to stabilize (was 50ms in thar0)
+ *   3. Speed-detect via CTL.JSTATE
+ *   4. Set ADDR = FSEN | 0
+ *   5. Configure EP_CTL[0] = RETRY_DIS | HSHK_EN | RX_EN | TX_EN
+ *   6. Bus reset: CTL = RESET | HOST_MODE_EN (USB_EN OFF)
+ *   7. Wait reset_hold_ms (thar0 uses 10ms — minimum TRSTRCY)
+ *   8. Release: CTL = HOST_MODE_EN (TWO-STEP — USB_EN still off)
+ *   9. Enable: CTL = HOST_MODE_EN | USB_EN
+ *  10. Wait post_reset_ms (thar0 uses 10ms; we use a bit more for safety)
+ *  11. Clear ISTAT/ERRSTAT/REG10
+ *  12. Enable INTEN = TOKDNEEN | ERROREN
+ *  13. Zero BDT + prime SETUP/RX buffers + reset SW pong
  *
- * NOT included here, because callers do them differently:
- *   - SW state reset (s_current_addr, ep toggles): process_attach only
- *     does this once at the very top; retry path doesn't touch them
- *     (we're still pre-SET_ADDRESS at this point either way).
- *   - Telemetry phase markers: caller sets them around the call.
- *   - SETUP buffer readback diagnostic: process_attach only, one-time.
- *   - TX_SUSPEND_BUSY drain: process_attach only, defensive no-op. */
-static void port_bringup(uint32_t post_reset_ms)
+ * Key change vs previous version:
+ *   - ADDR + EP_CTL set BEFORE bus reset (was AFTER)
+ *   - Reset hold short (10ms vs 50ms)
+ *   - Post-reset wait short (10-50ms vs 500-2000ms)
+ *   - Speed detect before reset (was after)
+ *   - ERREN enabled first
+ *
+ * Why this might fix the "first attempt fails / second works" pattern:
+ *   Thar0 configures the controller (ADDR/EP_CTL) BEFORE driving reset,
+ *   so when the device comes out of reset it sees an already-configured
+ *   host. Our previous order (reset → configure → SETUP) had a window
+ *   where the controller was post-reset but not yet configured to issue
+ *   SETUPs, possibly racing with the device's initial state.
+ *
+ * Caller params:
+ *   pre_reset_settle_ms: time before bus reset (50ms thar0; 500ms cold-boot)
+ *   reset_hold_ms:       SE0 hold time (10ms thar0)
+ *   post_reset_ms:       post-release wait (10ms thar0; 50ms our default) */
+static void port_bringup(uint32_t pre_reset_settle_ms,
+                         uint32_t reset_hold_ms,
+                         uint32_t post_reset_ms)
 {
-    /* DELIBERATELY NOT masking INTEN at top. HEAD (8110c01) didn't do
-     * this and it works. Masking during reset shouldn't matter (no
-     * tokens in flight), but adding it broke the cold-boot enum in
-     * a way we don't fully understand. Match HEAD's order exactly. */
+    /* === Step 1: enable error reporting === */
+    vusb11_write(s_port, VUSB11_OFF_ERREN, 0xFFu);
 
-    /* Hold the bus in reset (SE0) for 50ms. USB spec minimum is 10ms
-     * but many cheap drives need closer to 50ms to fully reset internal
-     * state. Keep HOST_MODE_EN set; USB_EN stays off during the reset
-     * hold (per thar0-ultralib's _usb_host_vusb11_reset_the_device). */
-    vusb11_write(s_port, VUSB11_OFF_CTL,
-                 VUSB11_CTL_RESET | VUSB11_CTL_HOST_MODE_EN);
-    usb_hal_wait_ms(50);
+    /* === Step 2: settle wait (D+ pull-up stabilization) === */
+    usb_hal_wait_ms(pre_reset_settle_ms);
 
-    /* Release reset and enable USB_EN in TWO separate writes (matches
-     * thar0's vusbh11ma.c:257-261). Combining them into one write was
-     * causing the controller's SIE to come up with stale BDT pong state
-     * — symptom was BUSTIMEOUT on first SETUP even though speed-detect
-     * showed FULL and the device was physically responsive. */
-    vusb11_write(s_port, VUSB11_OFF_CTL, VUSB11_CTL_HOST_MODE_EN);
-    vusb11_write(s_port, VUSB11_OFF_CTL,
-                 VUSB11_CTL_HOST_MODE_EN | VUSB11_CTL_USB_EN);
-
-
-    /* Caller-tuned post-reset wait. USB spec gives TRSTRCY = 10ms min,
-     * but a freshly-powered device needs longer for D+ pull-up; a
-     * suspended device needs longer to wake. */
-    usb_hal_wait_ms(post_reset_ms);
-
-    /* Speed detect — diagnostic only. Sample JSTATE up to 10 times with
-     * 5ms spacing because the device's pull-up settles non-determini-
-     * stically. USB Mass Storage is FS-only, so we always set ADDR.FSEN
-     * below regardless. Detect kept for telemetry. */
-    uint32_t ctl = 0;
-    for (int try = 0; try < 10; try++) {
-        ctl = vusb11_read(s_port, VUSB11_OFF_CTL);
-        if (ctl & VUSB11_CTL_JSTATE) break;
-        usb_hal_wait_ms(5);
-    }
+    /* === Step 3: speed detect via JSTATE === */
+    uint32_t ctl = vusb11_read(s_port, VUSB11_OFF_CTL);
     if (ctl & VUSB11_CTL_JSTATE) {
         vusbh11_device_speed = VUSBH11_SPEED_FULL;
     } else if (!(ctl & VUSB11_CTL_SE0)) {
         vusbh11_device_speed = VUSBH11_SPEED_LOW;
+    } else {
+        /* SE0 = either reset still asserted or no device attached.
+         * Continue anyway; we always treat as FS for Mass Storage. */
+        vusbh11_device_speed = VUSBH11_SPEED_UNKNOWN;
     }
 
-    /* Clear leftover ISTAT/ERRSTAT — RST will have asserted while we
-     * held the reset, and the wrapper REG10 mirrors it. */
+    /* === Step 4: ADDR = FSEN | 0 (device default address) === */
+    vusb11_write(s_port, VUSB11_OFF_ADDR, VUSB11_ADDR_FSEN | 0u);
+
+    /* === Step 5: EP_CTL[0] = RETRY_DIS | HSHK_EN | RX_EN | TX_EN ===
+     * Configure endpoint BEFORE reset so when device comes out of reset
+     * it sees a fully-configured host. */
+    vusb11_write(s_port, VUSB11_OFF_EP_CTL_BASE + 0u * 4u,
+                 VUSB11_EP_RETRY_DIS |
+                 VUSB11_EP_HSHK_EN | VUSB11_EP_RX_EN | VUSB11_EP_TX_EN);
+
+    /* === Step 6-7: bus reset (SE0 hold) ===
+     * RESET bit asserts SE0 on the bus. USB_EN off during reset
+     * (USB_DISABLE in thar0's nomenclature is just !USB_EN). */
+    vusb11_write(s_port, VUSB11_OFF_CTL,
+                 VUSB11_CTL_RESET | VUSB11_CTL_HOST_MODE_EN);
+    usb_hal_wait_ms(reset_hold_ms);
+
+    /* === Step 8-9: TWO-STEP release ===
+     * Release reset first (USB_EN still off), then enable USB_EN. Doing
+     * this as one write was previously documented to cause stale BDT
+     * pong state — keep two-step. */
+    vusb11_write(s_port, VUSB11_OFF_CTL, VUSB11_CTL_HOST_MODE_EN);
+    vusb11_write(s_port, VUSB11_OFF_CTL,
+                 VUSB11_CTL_HOST_MODE_EN | VUSB11_CTL_USB_EN);
+
+    /* === Step 10: post-reset settle === */
+    usb_hal_wait_ms(post_reset_ms);
+
+    /* === Step 11: clear sticky status bits === */
     vusb11_write(s_port, VUSB11_OFF_ISTAT,   0xFFu);
     vusb11_write(s_port, VUSB11_OFF_ERRSTAT, 0xFFu);
     vusb11_write(s_port, VUSB11_OFF_REG10,   0xFFu);
 
-    /* === ORDER from HEAD (8110c01) - DO NOT REORDER ===
-     * The original refactor moved EP_CTL/ADDR before BDT/SETUP and put
-     * INTEN enable last. That broke cold-boot enumeration (BUSTIMEOUT
-     * on first SETUP). HEAD's order works; matching it exactly. */
-
-    /* 1. Enable interrupts BEFORE BDT setup, so any reset-related IRQ
-     * that's still being processed has a place to land. USBRSTEN masked
-     * (we drive resets); SOFTOKEN off (1kHz noise). */
-    vusb11_write(s_port, VUSB11_OFF_ERREN, 0xFFu);
+    /* === Step 12: enable token-done + error interrupts ===
+     * USBRSTEN masked (we drive resets, don't need to be told about
+     * them). SOFTOKEN off (1kHz noise on the log/screen). */
     vusb11_write(s_port, VUSB11_OFF_INTEN,
                  VUSB11_INTEN_TOKDNEEN |
                  VUSB11_INTEN_ERROREN);
 
-    /* 2. Zero BDT region (4 EP0 entries). MUST happen BEFORE EP_CTL
-     * enables RX/TX, otherwise the controller could autonomously
-     * consume any stale OWN=1 slot still in MMIO from a prior session. */
+    /* === Step 13: BDT + buffer setup (not in thar0 — they prep BDT
+     * per-transaction via pipe management; we prep it here so the
+     * SETUP retry loop in process_attach can issue tokens immediately) === */
+
+    /* Zero BDT region (4 EP0 entries). After reset HW pong is Even, so
+     * SW must agree (set below). */
     for (uint32_t off = 0; off < 0x20u; off += 4u) {
         usb_hal_io_write(bdt_uncached_base() + off, 0u);
     }
 
-    /* 3. SETUP buffer: GET_DESCRIPTOR(DEVICE, 8).
+    /* SETUP buffer: GET_DESCRIPTOR(DEVICE, 8).
      * On-wire bytes 80 06 00 01 00 00 08 00. */
     uint32_t setup_uncached = dma_uncached_base() + BUF_SETUP_OFF;
     usb_hal_io_write(setup_uncached + 0, 0x80060001u);
     usb_hal_io_write(setup_uncached + 4, 0x00000800u);
 
-    /* 4. Clear RX buffer. */
+    /* Clear RX buffer so we can see exactly what came back. */
     uint32_t rx_uncached = dma_uncached_base() + BUF_RX_OFF;
     usb_hal_io_write(rx_uncached + 0, 0x00000000u);
     usb_hal_io_write(rx_uncached + 4, 0x00000000u);
 
-    /* 5. EP_CTL[0] = 0x4D = RETRY_DIS | HSHK_EN | RX_EN | TX_EN.
-     * RETRY_DIS required so SIE doesn't auto-retry NAKs internally.
-     * HOST_WO_HUB intentionally NOT set (it's "LS direct attach", not
-     * "no hub" - misleading name). Done AFTER BDT zeroed so enabling
-     * RX/TX doesn't pick up stale OWN=1 entries. */
-    vusb11_write(s_port, VUSB11_OFF_EP_CTL_BASE + 0u * 4u,
-                 VUSB11_EP_RETRY_DIS |
-                 VUSB11_EP_HSHK_EN | VUSB11_EP_RX_EN | VUSB11_EP_TX_EN);
-
-    /* 6. Default address 0, full-speed signaling. */
-    vusb11_write(s_port, VUSB11_OFF_ADDR, VUSB11_ADDR_FSEN | 0u);
-
-    /* 7. HW pong was reset by the bus reset; resync SW. */
+    /* SW pong reset — HW pong cleared to Even by bus reset; SW agrees. */
     s_rx_next_pong = 0;
     s_tx_next_pong = 0;
     s_rx_tokdne_pending = 0;
@@ -850,14 +858,19 @@ static void port_bringup(uint32_t post_reset_ms)
 __attribute__((unused))
 static void retry_recovery_hard(void)
 {
-    port_bringup(250);
+    /* Retry path — device should be alive but possibly wedged. Use
+     * thar0's minimum-viable timings; if it doesn't recover, an outer
+     * loop will call us again. */
+    port_bringup(50, 10, 50);
 }
 
-/* Public hub-level port reset. See vusbh11.h. */
+/* Public hub-level port reset. See vusbh11.h.
+ * Slightly longer pre-settle than retry_recovery_hard since this is
+ * called when the previous enum just failed — give the device a beat
+ * to fully resettle before the next attempt. */
 void vusbh11_port_reset(void)
 {
-    port_bringup(2000);  /* Match cold-boot wait — device may still be in
-                          * post-reset settling, needs full warm-up time. */
+    port_bringup(100, 10, 50);
 }
 
 /* ----- Bottom-half: process the first attach ----- */
@@ -886,14 +899,15 @@ static void process_attach(void)
     vusbh11_phase = 1;
     usb_hal_log("vusbh11: process_attach -> driving USB reset\n");
 
-    /* Bus reset + full controller re-init. Use 2000ms post-reset wait
-     * for cold-boot — empirically the device (USB stick or Pico) needs
-     * more than 500ms to be ready for SETUPs after VBUS cycle, and a
-     * too-short wait causes the first user-facing import-state attempt
-     * to fail (second manual attempt typically works because the device
-     * has had more time to boot). 2 sec is heavy but only matters once
-     * per session at the very first enum. */
-    port_bringup(2000);
+    /* Bus reset + full controller re-init. Thar0-style timings:
+     *   pre_reset_settle_ms = 500: longer than thar0's 50ms because we
+     *     may be called from cold boot where the device has only just
+     *     received VBUS and needs to fully power up before its D+ pull-up
+     *     is stable
+     *   reset_hold_ms = 10: matches thar0 (TRSTRCY min)
+     *   post_reset_ms = 50: a bit more than thar0's 10ms to be safe
+     * Total cold-boot delay: ~560ms (vs previous 2050ms) */
+    port_bringup(500, 10, 50);
 
     vusbh11_phase = 2;
     usb_hal_log("vusbh11: process_attach done; bus running\n");
