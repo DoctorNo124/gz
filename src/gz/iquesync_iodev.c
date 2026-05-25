@@ -27,14 +27,14 @@
 #include "vusb11.h"
 #include "vusbh11.h"
 
-#ifndef IQUESYNC_HOST_PORT
-/* USB0 = consumer cable. Empirically the working host port on this
- * iQue — USB1 (dev cable / breakout) didn't enumerate devices even
- * with code that was otherwise correct. Likely a hardware issue on
- * the USB1 path (breakout PCB, cable, or controller). USB0 works
- * reliably as host with the device plugged into the consumer port. */
-#define IQUESYNC_HOST_PORT  VUSB11_PORT_USB0
-#endif
+/* Runtime-selectable host port. Defaults to USB0 (the consumer-cable
+ * socket — empirically the working host port on this iQue; USB1 has
+ * been observed to silently not transmit despite correct code, likely
+ * a hardware issue on that path). The file menu exposes a toggle so
+ * other iQue units (or future debugging of the USB1 path) can switch
+ * without a rebuild. Takes effect on the next disk_init — toggling
+ * the menu option calls sys_reset to invalidate the FAT cache. */
+vusb11_port_t iquesync_host_port = VUSB11_PORT_USB0;
 
 #ifndef IQUESYNC_ATTACH_TIMEOUT_MS
 /* How long disk_init waits for ATTACH after bringing up the host stack.
@@ -62,7 +62,7 @@ static int iquesync_disk_init(void)
     /* Bring up the host driver on the chosen port. Installs the ISR
      * bridge thread and unmasks ATTACHEN. Idempotent: subsequent calls
      * are no-ops after the first successful init. */
-    if (vusbh11_init(IQUESYNC_HOST_PORT) != VUSB11_OK)
+    if (vusbh11_init(iquesync_host_port) != VUSB11_OK)
         return -1;
 
     /* Defensive: re-bind USB IRQ → bridge thread queue + re-arm MI mask.
@@ -73,7 +73,7 @@ static int iquesync_disk_init(void)
      * controller stuck with TX_SUSPEND_BUSY. usb_hal_irq_rearm()
      * re-registers our queue with libultra's event dispatch table
      * and re-enables MI without recreating the bridge thread. */
-    usb_hal_irq_rearm(IQUESYNC_HOST_PORT);
+    usb_hal_irq_rearm(iquesync_host_port);
 
     /* Single-shot enumeration, matching thar0's event-driven design.
      * Retries live where they can actually help:

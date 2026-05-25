@@ -97,6 +97,30 @@ static int ique_input_proc(struct menu_item *item,
   }
   return 0;
 }
+
+#include "vusb11.h"
+extern vusb11_port_t iquesync_host_port;
+static int usb_host_port_proc(struct menu_item *item,
+                              enum menu_callback_reason reason,
+                              void *data)
+{
+  if (reason == MENU_CALLBACK_THINK_INACTIVE) {
+    int v = (iquesync_host_port == VUSB11_PORT_USB1) ? 1 : 0;
+    if (menu_option_get(item) != v)
+      menu_option_set(item, v);
+  }
+  else if (reason == MENU_CALLBACK_DEACTIVATE) {
+    vusb11_port_t new_port = (menu_option_get(item) == 1) ? VUSB11_PORT_USB1
+                                                          : VUSB11_PORT_USB0;
+    if (new_port != iquesync_host_port) {
+      iquesync_host_port = new_port;
+      /* Invalidate FAT cache so the next file access re-runs disk_init
+       * against the new port. Same hook the "reset disk" button uses. */
+      sys_reset();
+    }
+  }
+  return 0;
+}
 #endif
 
 static void restore_gs_proc(struct menu_item *item, void *data)
@@ -300,6 +324,8 @@ struct menu *gz_file_menu(void)
 #if Z64_VERSION == Z64_OOTIQC
   menu_add_static(&menu, 0, 14, "input via", 0xC0C0C0);
   menu_add_option(&menu, 17, 14, "ique player\0""controller 2\0""controller 3\0""controller 4\0", ique_input_proc, NULL);
+  menu_add_static(&menu, 0, 15, "usb host port", 0xC0C0C0);
+  menu_add_option(&menu, 17, 15, "usb0\0""usb1\0", usb_host_port_proc, NULL);
 #endif
 
   return &menu;

@@ -670,7 +670,10 @@ static bool do_status_out_zlp(void)
 static bool do_status_in_zlp(void)
 {
     uint32_t rx_phys = dma_phys_base() + BUF_RX_OFF;
-    for (int attempt = 0; attempt < 20; attempt++) {
+    /* 500 × 10ms = ~5s patience. Used by control transfers including
+     * BOMSR; the device can legitimately NAK while it's still
+     * processing the previous SCSI command (flash erase/program). */
+    for (int attempt = 0; attempt < 500; attempt++) {
         uint32_t off = s_rx_next_pong ? BDT_EP0_RX_ODD_OFF : BDT_EP0_RX_EVEN_OFF;
         uint8_t  pong_at_issue = s_rx_next_pong;
         uint32_t tokdne_before = vusbh11_telem.tokdne_count;
@@ -1509,10 +1512,10 @@ static bool bulk_out(uint8_t ep, uint32_t buf_off, uint16_t n)
 
     /* NAK-retry loop. USB Mass Storage devices NAK OUT packets while
      * their flash controller is busy committing the previous write —
-     * sometimes for hundreds of milliseconds. Without retry, the first
-     * NAK during the WRITE_10 data phase aborts the entire transfer
-     * and gz sees an I/O error. Match the bulk_in NAK-retry pattern. */
-    for (int attempt = 0; attempt < 200; attempt++) {
+     * for an OVERWRITE of an already-programmed sector this can take
+     * 1-5 seconds (flash erase block + reprogram). 1000 × 5ms = ~5s
+     * patience matches typical OS USB-stack timeouts for SCSI writes. */
+    for (int attempt = 0; attempt < 1000; attempt++) {
         uint32_t off = s_tx_next_pong ? BDT_EP0_TX_ODD_OFF : BDT_EP0_TX_EVEN_OFF;
         prime_bdt_slot(off, ctrl, n, buf_phys);
         issue_token(VUSB11_TOKEN_OUT(ep));
@@ -1532,20 +1535,22 @@ static bool bulk_out(uint8_t ep, uint32_t buf_off, uint16_t n)
         s_ep_out_toggle[ep & 0xFu] ^= 1u;
         return true;
     }
-    usb_hal_log("vusbh11: bulk OUT EP%u gave up after 200 NAKs\n", ep);
+    usb_hal_log("vusbh11: bulk OUT EP%u gave up after 1000 NAKs\n", ep);
     return false;
 }
 
 /* Bulk IN: receive up to `max_n` bytes into the buffer at `buf_off` from
- * endpoint `ep`. NAK-retry loop up to 50 attempts. Returns received byte
- * count on success, 0 on failure/STALL/timeout. */
+ * endpoint `ep`. Returns received byte count on success, 0 on failure/
+ * STALL/timeout. The CSW reception path goes through here, and an
+ * overwrite WRITE_10 can have the device NAK the CSW for 1-5s while
+ * its flash erase-block cycle finishes — match the bulk_out budget. */
 static uint16_t bulk_in(uint8_t ep, uint32_t buf_off, uint16_t max_n)
 {
     uint32_t buf_phys = dma_phys_base() + buf_off;
     uint8_t  toggle   = s_ep_in_toggle[ep & 0xFu];
     uint8_t  ctrl     = toggle ? 0xC8u : 0x88u;
 
-    for (int attempt = 0; attempt < 50; attempt++) {
+    for (int attempt = 0; attempt < 500; attempt++) {
         uint32_t off = s_rx_next_pong ? BDT_EP0_RX_ODD_OFF : BDT_EP0_RX_EVEN_OFF;
         prime_bdt_slot(off, ctrl, max_n, buf_phys);
         issue_token(VUSB11_TOKEN_IN(ep));
@@ -1566,7 +1571,7 @@ static uint16_t bulk_in(uint8_t ep, uint32_t buf_off, uint16_t max_n)
         s_ep_in_toggle[ep & 0xFu] ^= 1u;
         return (uint16_t)(((w0 >> 8) & 0xFFu) | ((w0 & 0x03u) << 8));
     }
-    usb_hal_log("vusbh11: bulk IN EP%u gave up after 50 NAKs\n", ep);
+    usb_hal_log("vusbh11: bulk IN EP%u gave up after 500 NAKs\n", ep);
     return 0;
 }
 
