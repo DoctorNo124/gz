@@ -188,6 +188,12 @@ extern volatile vusbh11_telem_t vusbh11_telem;
 vusb11_status_t vusbh11_init(vusb11_port_t port);
 void            vusbh11_shutdown(void);
 
+/* Call right before a gz soft-reset (full N64 reboot via zu_reset).
+ * Forces the next vusbh11_init to do a complete re-init — the reboot
+ * re-initializes libultra and orphans our ISR bridge thread, so the
+ * thread/queue/event binding must be recreated. */
+void            vusbh11_notify_reset(void);
+
 /* Hub-level port reset. Drives a full SE0 reset cycle + re-runs the
  * controller-side bringup (clears BDT, re-writes EP_CTL/ADDR, re-arms
  * interrupts). Use this as the escalation when normal enumeration fails

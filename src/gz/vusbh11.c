@@ -518,6 +518,21 @@ void vusbh11_shutdown(void)
     s_initted = false;
 }
 
+void vusbh11_notify_reset(void)
+{
+    /* A gz soft-reset performs a full N64 reboot (zu_reset), which
+     * re-initializes libultra and removes our ISR bridge thread from
+     * the scheduler — but gz's BSS persists, so s_initted would stay
+     * true and vusbh11_init's guard would skip recreating the thread,
+     * leaving USB IRQs delivered to a queue no thread services (observed
+     * as attach_count=0 / "no disk" after a soft-reset). Clear the flag
+     * so the next vusbh11_init does a full re-init (osCreateThread on
+     * the now-orphaned struct is safe: libultra is fresh post-reboot).
+     * No cache flush needed here — zu_reset writes back the whole dcache
+     * before rebooting, so this store reaches RDRAM. */
+    s_initted = false;
+}
+
 /* ----- Reusable control-transfer helpers ----- */
 
 /* Write 8 bytes into the SETUP buffer. Bytes are placed in physical order

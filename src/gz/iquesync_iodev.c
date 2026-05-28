@@ -23,9 +23,11 @@
 #include "ique.h"
 #include "iodev.h"
 #include "io.h"
+#include "sys.h"
 #include "usb_hal.h"
 #include "vusb11.h"
 #include "vusbh11.h"
+#include "zu.h"
 
 /* Runtime-selectable host port. Defaults to USB0 (the consumer-cable
  * socket — empirically the working host port on this iQue; USB1 has
@@ -111,13 +113,33 @@ static int iquesync_disk_write(size_t lba, size_t n_blocks, const void *src)
     return vusbh11_disk_write((uint32_t)lba, (uint32_t)n_blocks, src);
 }
 
+static void iquesync_cpu_reset(void)
+{
+    /* gz soft-reset path. zu_reset() does a full N64 reboot that
+     * re-initializes libultra and orphans our USB ISR bridge thread,
+     * but gz's BSS (s_initted, fat_ready, ...) persists. Without this
+     * hook the post-reboot stack thinks USB + FAT are still up: the
+     * orphaned thread never delivers ATTACH ("no disk") and the stale
+     * FAT mount shows an empty directory.
+     *
+     * sys_reset() invalidates the FAT mount (re-mount on next access);
+     * vusbh11_notify_reset() forces a full USB re-init (recreates the
+     * bridge thread). Both are plain cached writes, but zu_reset()
+     * writes back the entire dcache before rebooting, so they survive.
+     * Then zu_reset() performs the actual reboot and never returns. */
+    sys_reset();
+    vusbh11_notify_reset();
+    zu_reset();
+}
+
 struct iodev iquesync_iodev = {
     .probe       = iquesync_probe,
     .disk_init   = iquesync_disk_init,
     .disk_read   = iquesync_disk_read,
     .disk_write  = iquesync_disk_write,
-    /* fifo_* / clock_* / cpu_reset deliberately NULL — gz falls back to
-     * its defaults (CP0 COUNT, zu_reset) which work fine on iQue. */
+    .cpu_reset   = iquesync_cpu_reset,
+    /* fifo_* / clock_* deliberately NULL — gz falls back to its
+     * defaults (CP0 COUNT) which work fine on iQue. */
 };
 
 #endif /* Z64_VERSION == Z64_OOTIQC */
